@@ -486,7 +486,7 @@ async function ensureAdminTablesExist() {
             CREATE TABLE IF NOT EXISTS admins (
                 id SERIAL PRIMARY KEY,
                 name TEXT,
-                email TEXT UNIQUE NOT NULL,
+                username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             )
@@ -522,17 +522,51 @@ async function ensureAdminTablesExist() {
 
 
 // ========================================
+// ADMIN TABLE — USERNAME COLUMN SAFETY NET
+// (in case an earlier deploy already created
+// the admins table with the old email-based
+// schema — adds username without breaking
+// any existing rows)
+// ========================================
+
+async function ensureAdminUsernameColumnExists() {
+
+    try {
+
+        await pool.query(
+            `ALTER TABLE admins ADD COLUMN IF NOT EXISTS username TEXT`
+        );
+
+        console.log(
+            "Admin username column is ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not add admin username column:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
 // SEED THE FIRST ADMIN ACCOUNT
 // (from environment variables, only if
 // there are no admins yet)
 // ========================================
 
 /*
-    Put these in your Render Environment Variables
+    Put this in your Render Environment Variables
     to create your first admin account automatically:
 
-    ADMIN_EMAIL=you@example.com
     ADMIN_PASSWORD=choose-a-strong-password
+
+    The username defaults to "Elkurios" unless you
+    also set ADMIN_USERNAME to something else.
 
     After the first admin exists, these env vars are
     no longer used — manage further admins directly
@@ -551,33 +585,36 @@ async function seedInitialAdmin() {
             return;
         }
 
-        if (!process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD) {
+        if (!process.env.ADMIN_PASSWORD) {
 
             console.log(
-                "No admin account yet — set ADMIN_EMAIL and ADMIN_PASSWORD to create one."
+                "No admin account yet — set ADMIN_PASSWORD (and optionally ADMIN_USERNAME) to create one."
             );
 
             return;
 
         }
 
+        const username =
+            (process.env.ADMIN_USERNAME || "Elkurios").trim();
+
         const passwordHash =
             await bcrypt.hash(process.env.ADMIN_PASSWORD, 12);
 
         await pool.query(
             `
-            INSERT INTO admins (name, email, password_hash)
+            INSERT INTO admins (name, username, password_hash)
             VALUES ($1, $2, $3)
             `,
             [
                 "Kurios Admin",
-                process.env.ADMIN_EMAIL.trim().toLowerCase(),
+                username,
                 passwordHash
             ]
         );
 
         console.log(
-            "Initial admin account created for " + process.env.ADMIN_EMAIL
+            "Initial admin account created with username " + username
         );
 
     } catch (error) {
@@ -665,6 +702,7 @@ async function runMigrations() {
     await ensureSellersTableExists();
     await ensureSellerPaymentColumnsExist();
     await ensureAdminTablesExist();
+    await ensureAdminUsernameColumnExists();
     await seedInitialAdmin();
 
 }
@@ -3107,32 +3145,32 @@ app.post("/api/admin/login", async (req, res) => {
 
     try {
 
-        const { email, password } = req.body;
+        const { username, password } = req.body;
 
-        if (!email || !password) {
+        if (!username || !password) {
 
             return res.status(400).json({
                 success: false,
-                message: "Email and password are required."
+                message: "Username and password are required."
             });
 
         }
 
         const adminResult = await pool.query(
             `
-            SELECT id, name, email, password_hash
+            SELECT id, name, username, password_hash
             FROM admins
-            WHERE LOWER(email) = LOWER($1)
+            WHERE LOWER(username) = LOWER($1)
             LIMIT 1
             `,
-            [email.trim()]
+            [username.trim()]
         );
 
         if (adminResult.rows.length === 0) {
 
             return res.status(401).json({
                 success: false,
-                message: "Invalid email or password."
+                message: "Invalid username or password."
             });
 
         }
@@ -3146,7 +3184,7 @@ app.post("/api/admin/login", async (req, res) => {
 
             return res.status(401).json({
                 success: false,
-                message: "Invalid email or password."
+                message: "Invalid username or password."
             });
 
         }
@@ -3182,7 +3220,7 @@ app.post("/api/admin/login", async (req, res) => {
             admin: {
                 id: admin.id,
                 name: admin.name,
-                email: admin.email
+                username: admin.username
             }
 
         });
@@ -3239,7 +3277,7 @@ async function requireAdminAuth(req, res, next) {
 
         const sessionResult = await pool.query(
             `
-            SELECT admin_sessions.admin_id, admins.name, admins.email
+            SELECT admin_sessions.admin_id, admins.name, admins.username
             FROM admin_sessions
             JOIN admins ON admins.id = admin_sessions.admin_id
             WHERE admin_sessions.token = $1
