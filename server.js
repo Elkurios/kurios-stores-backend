@@ -512,8 +512,8 @@ app.post("/api/students/register", async (req, res) => {
             whatsappNumber,
             university,
             studentId,
-            password,
-            confirmPassword,
+            passcode,
+            confirmPasscode,
             agreedStudent,
             agreedTerms,
             agreedPrivacy,
@@ -532,8 +532,8 @@ app.post("/api/students/register", async (req, res) => {
             !phone ||
             !university ||
             !studentId ||
-            !password ||
-            !confirmPassword
+            !passcode ||
+            !confirmPasscode
         ) {
 
             return res.status(400).json({
@@ -545,14 +545,28 @@ app.post("/api/students/register", async (req, res) => {
 
 
         // ====================================
-        // PASSWORD MATCH
+        // PASSCODE FORMAT
         // ====================================
 
-        if (password !== confirmPassword) {
+        if (!/^\d{6}$/.test(passcode)) {
 
             return res.status(400).json({
                 success: false,
-                message: "Passwords do not match."
+                message: "Your passcode must be exactly 6 digits."
+            });
+
+        }
+
+
+        // ====================================
+        // PASSCODE MATCH
+        // ====================================
+
+        if (passcode !== confirmPasscode) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Passcodes do not match."
             });
 
         }
@@ -691,12 +705,12 @@ if (emailCheck.rows.length > 0) {
 
 
     // ====================================
-    // HASH NEW PASSWORD
+    // HASH NEW PASSCODE
     // ====================================
 
     const passwordHash =
         await bcrypt.hash(
-            password,
+            passcode,
             12
         );
 
@@ -959,11 +973,11 @@ if (emailCheck.rows.length > 0) {
 
 
         // ====================================
-        // HASH PASSWORD
+        // HASH PASSCODE
         // ====================================
 
         const passwordHash = await bcrypt.hash(
-            password,
+            passcode,
             12
         );
 
@@ -1660,7 +1674,7 @@ app.post("/api/students/login", async (req, res) => {
 
         const {
             email,
-            password
+            passcode
         } = req.body;
 
 
@@ -1668,11 +1682,11 @@ app.post("/api/students/login", async (req, res) => {
         // VALIDATE INPUT
         // ========================================
 
-        if (!email || !password) {
+        if (!email || !passcode) {
 
             return res.status(400).json({
                 success: false,
-                message: "Email and password are required."
+                message: "Email and passcode are required."
             });
 
         }
@@ -1715,7 +1729,7 @@ app.post("/api/students/login", async (req, res) => {
 
             return res.status(401).json({
                 success: false,
-                message: "Invalid email or password."
+                message: "Invalid email or passcode."
             });
 
         }
@@ -1744,23 +1758,21 @@ app.post("/api/students/login", async (req, res) => {
 
 
         // ========================================
-        // CHECK PASSWORD
+        // CHECK PASSCODE
         // ========================================
 
-        const passwordMatches =
+        const passcodeMatches =
             await bcrypt.compare(
-                password,
+                passcode,
                 student.password_hash
             );
 
-            console.log("PASSWORD MATCH:", passwordMatches);
 
-
-        if (!passwordMatches) {
+        if (!passcodeMatches) {
 
             return res.status(401).json({
                 success: false,
-                message: "Invalid email or password."
+                message: "Invalid email or passcode."
             });
 
         }
@@ -1811,9 +1823,340 @@ app.post("/api/students/login", async (req, res) => {
 
 
 // ========================================
-// UPDATE STUDENT PROFILE
-// (phone, date of birth, profile picture)
+// REQUEST A PASSCODE RESET
+// (sends an OTP to the student's email)
 // ========================================
+
+app.post("/api/students/request-passcode-reset", async (req, res) => {
+
+    try {
+
+        const { email } = req.body;
+
+        if (!email) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please enter your email address."
+            });
+
+        }
+
+
+        // ====================================
+        // FIND STUDENT
+        // ====================================
+
+        const studentResult = await pool.query(
+            `
+            SELECT id, first_name, email
+            FROM students
+            WHERE LOWER(email) = LOWER($1)
+            LIMIT 1
+            `,
+            [email.trim()]
+        );
+
+        if (studentResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "We couldn't find a Kurios Stores account with that email."
+            });
+
+        }
+
+        const student = studentResult.rows[0];
+
+
+        // ====================================
+        // GENERATE OTP
+        // ====================================
+
+        const otp =
+            crypto.randomInt(100000, 1000000).toString();
+
+        const expiresAt =
+            new Date(Date.now() + 10 * 60 * 1000);
+
+
+        // ====================================
+        // REMOVE OLD OTPs, SAVE NEW ONE
+        // ====================================
+
+        await pool.query(
+            `
+            DELETE FROM student_verification_codes
+            WHERE student_id = $1
+            AND verified = false
+            `,
+            [student.id]
+        );
+
+        await pool.query(
+            `
+            INSERT INTO student_verification_codes
+            (student_id, otp, expires_at)
+            VALUES ($1, $2, $3)
+            `,
+            [student.id, otp, expiresAt]
+        );
+
+
+        // ====================================
+        // SEND RESET EMAIL
+        // ====================================
+
+        await sendEmail({
+
+            to: student.email,
+
+            subject: "Reset Your Kurios Stores Passcode",
+
+            html: `
+                <div style="
+                    font-family: Arial, sans-serif;
+                    max-width: 600px;
+                    margin: 0 auto;
+                    padding: 30px;
+                    border: 1px solid #e5e7eb;
+                    border-radius: 12px;
+                ">
+
+                    <h2 style="color: #5b21b6;">
+                        Reset Your Passcode
+                    </h2>
+
+                    <p>
+                        Hello <strong>${student.first_name}</strong>,
+                    </p>
+
+                    <p>
+                        Use the code below to set a new 6-digit
+                        passcode for your Kurios Stores account.
+                    </p>
+
+                    <div style="
+                        margin: 25px 0;
+                        padding: 20px;
+                        text-align: center;
+                        background: #f3f0ff;
+                        border-radius: 10px;
+                    ">
+                        <span style="
+                            font-size: 32px;
+                            font-weight: bold;
+                            letter-spacing: 8px;
+                            color: #5b21b6;
+                        ">
+                            ${otp}
+                        </span>
+                    </div>
+
+                    <p>
+                        This code will expire in <strong>10 minutes</strong>.
+                    </p>
+
+                    <p>
+                        If you did not request this, you can
+                        safely ignore this email.
+                    </p>
+
+                    <br>
+
+                    <p>
+                        Regards,<br>
+                        <strong>Kurios Stores</strong>
+                    </p>
+
+                </div>
+            `
+
+        });
+
+
+        res.status(200).json({
+
+            success: true,
+
+            message: "A passcode reset code has been sent to your email.",
+
+            studentId: student.id,
+
+            email: student.email
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Passcode reset request error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Something went wrong while requesting a passcode reset."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CONFIRM A PASSCODE RESET
+// (verifies the OTP and sets a new passcode)
+// ========================================
+
+app.post("/api/students/reset-passcode", async (req, res) => {
+
+    try {
+
+        const {
+            studentId,
+            otp,
+            newPasscode,
+            confirmNewPasscode
+        } = req.body;
+
+        if (
+            !studentId ||
+            !otp ||
+            !newPasscode ||
+            !confirmNewPasscode
+        ) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please fill in all fields."
+            });
+
+        }
+
+        if (!/^\d{6}$/.test(newPasscode)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Your new passcode must be exactly 6 digits."
+            });
+
+        }
+
+        if (newPasscode !== confirmNewPasscode) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Passcodes do not match."
+            });
+
+        }
+
+
+        // ====================================
+        // FIND OTP
+        // ====================================
+
+        const otpResult = await pool.query(
+            `
+            SELECT id, expires_at
+            FROM student_verification_codes
+            WHERE student_id = $1
+            AND otp = $2
+            AND verified = false
+            ORDER BY created_at DESC
+            LIMIT 1
+            `,
+            [studentId, otp.toString().trim()]
+        );
+
+        if (otpResult.rows.length === 0) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Invalid verification code."
+            });
+
+        }
+
+        const verificationCode = otpResult.rows[0];
+
+        if (new Date(verificationCode.expires_at) < new Date()) {
+
+            return res.status(400).json({
+                success: false,
+                message: "This verification code has expired. Please request a new one."
+            });
+
+        }
+
+
+        // ====================================
+        // MARK OTP AS USED
+        // ====================================
+
+        await pool.query(
+            `
+            UPDATE student_verification_codes
+            SET verified = true
+            WHERE id = $1
+            `,
+            [verificationCode.id]
+        );
+
+
+        // ====================================
+        // SET NEW PASSCODE
+        // ====================================
+
+        const passwordHash =
+            await bcrypt.hash(newPasscode, 12);
+
+        const updatedStudent = await pool.query(
+            `
+            UPDATE students
+            SET
+                password_hash = $1,
+                email_verified = true,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = $2
+            RETURNING id, email
+            `,
+            [passwordHash, studentId]
+        );
+
+        if (updatedStudent.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Student account could not be found."
+            });
+
+        }
+
+        res.status(200).json({
+
+            success: true,
+
+            message: "Your passcode has been reset. You can now sign in."
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Passcode reset confirm error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Something went wrong while resetting your passcode."
+        });
+
+    }
+
+});
 
 app.post(
     "/api/students/update-profile",
