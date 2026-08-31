@@ -1716,8 +1716,8 @@ app.post("/api/students/login", async (req, res) => {
             FROM students
             WHERE
                 LOWER(email) = LOWER($1)
-                OR regexp_replace(phone, '\\D', '', 'g') =
-                   regexp_replace($1, '\\D', '', 'g')
+                OR RIGHT(regexp_replace(phone, '\\D', '', 'g'), 10) =
+                   RIGHT(regexp_replace($1, '\\D', '', 'g'), 10)
             LIMIT 1
             `,
             [
