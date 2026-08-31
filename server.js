@@ -1673,7 +1673,7 @@ app.post("/api/students/login", async (req, res) => {
     try {
 
         const {
-            email,
+            identifier,
             passcode
         } = req.body;
 
@@ -1682,18 +1682,20 @@ app.post("/api/students/login", async (req, res) => {
         // VALIDATE INPUT
         // ========================================
 
-        if (!email || !passcode) {
+        if (!identifier || !passcode) {
 
             return res.status(400).json({
                 success: false,
-                message: "Email and passcode are required."
+                message: "Email/phone and passcode are required."
             });
 
         }
 
 
         // ========================================
-        // FIND STUDENT
+        // FIND STUDENT — BY EMAIL OR PHONE
+        // (phone is compared digits-only, so
+        // spaces/dashes/brackets don't matter)
         // ========================================
 
         const studentResult = await pool.query(
@@ -1712,11 +1714,14 @@ app.post("/api/students/login", async (req, res) => {
                 password_hash,
                 email_verified
             FROM students
-            WHERE LOWER(email) = LOWER($1)
+            WHERE
+                LOWER(email) = LOWER($1)
+                OR regexp_replace(phone, '\\D', '', 'g') =
+                   regexp_replace($1, '\\D', '', 'g')
             LIMIT 1
             `,
             [
-                email.trim()
+                identifier.trim()
             ]
         );
 
@@ -1729,7 +1734,7 @@ app.post("/api/students/login", async (req, res) => {
 
             return res.status(401).json({
                 success: false,
-                message: "Invalid email or passcode."
+                message: "Invalid email/phone or passcode."
             });
 
         }
@@ -1772,7 +1777,7 @@ app.post("/api/students/login", async (req, res) => {
 
             return res.status(401).json({
                 success: false,
-                message: "Invalid email or passcode."
+                message: "Invalid email/phone or passcode."
             });
 
         }
