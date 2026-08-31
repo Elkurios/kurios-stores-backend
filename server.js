@@ -376,8 +376,15 @@ async function ensureProfileColumnsExist() {
             `
         );
 
+        await pool.query(
+            `
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN DEFAULT false
+            `
+        );
+
         console.log(
-            "Profile columns (date_of_birth, profile_picture) are ready."
+            "Profile columns (date_of_birth, profile_picture, is_suspended) are ready."
         );
 
     } catch (error) {
@@ -683,6 +690,43 @@ async function ensureSellerPaymentColumnsExist() {
 
 
 // ========================================
+// NOTIFICATIONS TABLE
+// (admin announcements sent to all students)
+// ========================================
+
+async function ensureNotificationsTableExists() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS notifications (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_by INTEGER REFERENCES admins(id),
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        console.log(
+            "Notifications table is ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not create notifications table:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
 // RUN ALL MIGRATIONS, IN ORDER
 // ========================================
 
@@ -704,6 +748,7 @@ async function runMigrations() {
     await ensureAdminTablesExist();
     await ensureAdminUsernameColumnExists();
     await seedInitialAdmin();
+    await ensureNotificationsTableExists();
 
 }
 
@@ -1968,7 +2013,8 @@ app.post("/api/students/login", async (req, res) => {
                 date_of_birth,
                 profile_picture,
                 password_hash,
-                email_verified
+                email_verified,
+                is_suspended
             FROM students
             WHERE
                 LOWER(email) = LOWER($1)
@@ -1998,6 +2044,21 @@ app.post("/api/students/login", async (req, res) => {
 
         const student =
             studentResult.rows[0];
+
+
+        // ========================================
+        // CHECK SUSPENSION
+        // ========================================
+
+        if (student.is_suspended) {
+
+            return res.status(403).json({
+                success: false,
+                message:
+                    "Your account has been suspended. Contact Kurios Stores support for details."
+            });
+
+        }
 
 
         // ========================================
@@ -3885,6 +3946,257 @@ app.post(
     "/api/admin/sellers/:id/suspend",
     requireAdminAuth,
     (req, res) => updateSellerStatus(req, res, "suspended")
+);
+
+
+// ========================================
+// GET LATEST NOTIFICATIONS
+// (public — used by the student notification bell)
+// ========================================
+
+app.get("/api/notifications", async (req, res) => {
+
+    try {
+
+        const result = await pool.query(
+            `
+            SELECT id, title, message, created_at
+            FROM notifications
+            ORDER BY created_at DESC
+            LIMIT 20
+            `
+        );
+
+        res.status(200).json({
+            success: true,
+            notifications: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch notifications error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load notifications."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ADMIN — SEND AN ANNOUNCEMENT TO ALL STUDENTS
+// ========================================
+
+app.post(
+    "/api/admin/notifications",
+    requireAdminAuth,
+    async (req, res) => {
+
+        try {
+
+            const { title, message } = req.body;
+
+            if (!title || !message) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Please provide a title and a message."
+                });
+
+            }
+
+            const result = await pool.query(
+                `
+                INSERT INTO notifications (title, message, created_by)
+                VALUES ($1, $2, $3)
+                RETURNING *
+                `,
+                [
+                    title.trim(),
+                    message.trim(),
+                    req.admin.admin_id
+                ]
+            );
+
+            res.status(201).json({
+
+                success: true,
+
+                message: "Announcement sent to all students.",
+
+                notification: result.rows[0]
+
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Send notification error:",
+                error.message
+            );
+
+            res.status(500).json({
+                success: false,
+                message: "Could not send the announcement."
+            });
+
+        }
+
+    }
+);
+
+
+// ========================================
+// ADMIN — LIST / SEARCH STUDENTS
+// ========================================
+
+app.get(
+    "/api/admin/students",
+    requireAdminAuth,
+    async (req, res) => {
+
+        try {
+
+            const { search } = req.query;
+
+            let query =
+                `
+                SELECT
+                    id,
+                    first_name,
+                    last_name,
+                    email,
+                    phone,
+                    whatsapp_number,
+                    university,
+                    student_id,
+                    email_verified,
+                    is_suspended,
+                    created_at
+                FROM students
+                `;
+
+            const params = [];
+
+            if (search && search.trim()) {
+
+                query +=
+                    `
+                    WHERE
+                        first_name ILIKE $1
+                        OR last_name ILIKE $1
+                        OR email ILIKE $1
+                        OR university ILIKE $1
+                        OR student_id ILIKE $1
+                        OR phone ILIKE $1
+                    `;
+
+                params.push("%" + search.trim() + "%");
+
+            }
+
+            query += ` ORDER BY created_at DESC LIMIT 200`;
+
+            const result =
+                await pool.query(query, params);
+
+            res.status(200).json({
+                success: true,
+                students: result.rows
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Admin list students error:",
+                error.message
+            );
+
+            res.status(500).json({
+                success: false,
+                message: "Could not load students."
+            });
+
+        }
+
+    }
+);
+
+
+// ========================================
+// ADMIN — SUSPEND / UNSUSPEND A STUDENT
+// ========================================
+
+async function setStudentSuspension(req, res, suspended) {
+
+    try {
+
+        const { id } = req.params;
+
+        const result = await pool.query(
+            `
+            UPDATE students
+            SET is_suspended = $1, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $2
+            RETURNING id, first_name, last_name, email, is_suspended
+            `,
+            [suspended, id]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Student account could not be found."
+            });
+
+        }
+
+        res.status(200).json({
+
+            success: true,
+
+            message:
+                suspended ?
+                    "Student account suspended." :
+                    "Student account reinstated.",
+
+            student: result.rows[0]
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Update student suspension error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not update this student's account."
+        });
+
+    }
+
+}
+
+app.post(
+    "/api/admin/students/:id/suspend",
+    requireAdminAuth,
+    (req, res) => setStudentSuspension(req, res, true)
+);
+
+app.post(
+    "/api/admin/students/:id/unsuspend",
+    requireAdminAuth,
+    (req, res) => setStudentSuspension(req, res, false)
 );
 
 
