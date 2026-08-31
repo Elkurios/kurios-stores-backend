@@ -230,6 +230,88 @@ pool.query("SELECT NOW()")
 
 
 // ========================================
+// AUTO-MIGRATE BASE TABLES
+// ========================================
+
+/*
+    Creates the core tables this app needs if
+    they don't already exist — so a brand new
+    database (like on a fresh Render deploy)
+    works without anyone running SQL by hand.
+    Existing tables/data are left untouched.
+*/
+
+async function ensureBaseTablesExist() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS students (
+                id SERIAL PRIMARY KEY,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                phone TEXT,
+                whatsapp_number TEXT,
+                university TEXT,
+                student_id TEXT,
+                password_hash TEXT NOT NULL,
+                agreed_terms BOOLEAN DEFAULT false,
+                agreed_privacy BOOLEAN DEFAULT false,
+                receive_notifications BOOLEAN DEFAULT true,
+                email_verified BOOLEAN DEFAULT false,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS student_verification_codes (
+                id SERIAL PRIMARY KEY,
+                student_id INTEGER REFERENCES students(id),
+                otp TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                verified BOOLEAN DEFAULT false,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS products (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                price NUMERIC(12, 2) NOT NULL,
+                image_url TEXT,
+                category TEXT,
+                stock_quantity INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        console.log(
+            "Base tables (students, student_verification_codes, products) are ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not create base tables:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
 // AUTO-MIGRATE NEW PROFILE COLUMNS
 // ========================================
 
@@ -273,8 +355,6 @@ async function ensureProfileColumnsExist() {
 
 }
 
-ensureProfileColumnsExist();
-
 
 // ========================================
 // AUTO-MIGRATE ORDERS TABLE
@@ -315,7 +395,28 @@ async function ensureOrdersTableExists() {
 
 }
 
-ensureOrdersTableExists();
+
+// ========================================
+// RUN ALL MIGRATIONS, IN ORDER
+// ========================================
+
+/*
+    These run one after another (not all at
+    once) because later ones depend on earlier
+    ones — the orders table references students,
+    and the profile columns are added onto
+    students, so students has to exist first.
+*/
+
+async function runMigrations() {
+
+    await ensureBaseTablesExist();
+    await ensureProfileColumnsExist();
+    await ensureOrdersTableExists();
+
+}
+
+runMigrations();
 
 
 // ========================================
