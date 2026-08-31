@@ -1421,6 +1421,8 @@ app.post("/api/students/resend-otp", async (req, res) => {
         const student =
             studentResult.rows[0];
 
+            console.log("LOGIN USER FOUND:", student.email);
+
 
         // ====================================
         // CHECK IF ALREADY VERIFIED
@@ -1722,6 +1724,8 @@ app.post("/api/students/login", async (req, res) => {
                 password,
                 student.password_hash
             );
+
+            console.log("PASSWORD MATCH:", passwordMatches);
 
 
         if (!passwordMatches) {
