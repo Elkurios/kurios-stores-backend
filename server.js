@@ -207,6 +207,11 @@ app.use(cors());
 // ========================================
 
 const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false
+    }
+});
     host: process.env.PGHOST,
     port: process.env.PGPORT,
     database: process.env.PGDATABASE,
@@ -2386,10 +2391,8 @@ app.get("/api/orders", async (req, res) => {
 // START SERVER
 // ========================================
 
+const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-
-    console.log(
-        `Kurios Stores server is running on port ${PORT}`
-    );
-
+    console.log(`Kurios Stores server is running on port ${PORT}`);
 });
