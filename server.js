@@ -530,6 +530,7 @@ app.post("/api/students/register", async (req, res) => {
             !lastName ||
             !email ||
             !phone ||
+            !whatsappNumber ||
             !university ||
             !studentId ||
             !passcode ||
