@@ -48,6 +48,199 @@ const MONNIFY_BASE_URL =
 
 
 // ========================================
+// OPAY PAYMENT CONFIGURATION
+// ========================================
+
+/*
+    Put these in your .env file:
+
+    OPAY_MERCHANT_ID=...
+    OPAY_PUBLIC_KEY=...
+    OPAY_SECRET_KEY=...
+    OPAY_BASE_URL=https://testapi.opaycheckout.com
+
+    Switch OPAY_BASE_URL to https://liveapi.opaycheckout.com
+    when you go live.
+*/
+
+const OPAY_MERCHANT_ID = process.env.OPAY_MERCHANT_ID;
+const OPAY_PUBLIC_KEY = process.env.OPAY_PUBLIC_KEY;
+const OPAY_SECRET_KEY = process.env.OPAY_SECRET_KEY;
+const OPAY_BASE_URL =
+    process.env.OPAY_BASE_URL ||
+    "https://testapi.opaycheckout.com";
+
+// Your backend's own public URL, used to build the
+// OPay callback (webhook) URL. Set this in Render's
+// Environment Variables to your Render service URL,
+// e.g. https://kurios-stores-backend.onrender.com
+
+const BACKEND_URL =
+    process.env.BACKEND_URL ||
+    "https://kurios-stores-backend.onrender.com";
+
+const OPAY_CALLBACK_URL =
+    BACKEND_URL + "/api/opay/webhook";
+
+
+// ========================================
+// SIGN AN OPAY REQUEST
+// ========================================
+
+/*
+    OPay signs requests with HMAC-SHA512 of the
+    request body, signed with your Secret Key.
+    The body's keys must be sorted alphabetically
+    before signing.
+*/
+
+function signOpayPayload(payload) {
+
+    function sortKeys(value) {
+
+        if (Array.isArray(value)) {
+            return value.map(sortKeys);
+        }
+
+        if (value && typeof value === "object") {
+
+            const sorted = {};
+
+            Object.keys(value)
+                .sort()
+                .forEach(function (key) {
+                    sorted[key] = sortKeys(value[key]);
+                });
+
+            return sorted;
+
+        }
+
+        return value;
+
+    }
+
+    const sortedPayload =
+        JSON.stringify(sortKeys(payload));
+
+    return crypto
+        .createHmac("sha512", OPAY_SECRET_KEY)
+        .update(sortedPayload)
+        .digest("hex");
+
+}
+
+
+// ========================================
+// CREATE AN OPAY CASHIER PAYMENT
+// (returns a hosted checkout URL to redirect to)
+// ========================================
+
+async function createOpayCashierPayment({
+    reference,
+    amountNaira,
+    customerName,
+    customerEmail,
+    description,
+    returnUrl,
+    callbackUrl
+}) {
+
+    const response = await fetch(
+        OPAY_BASE_URL + "/api/v1/international/cashier/create",
+        {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + OPAY_PUBLIC_KEY,
+                "MerchantId": OPAY_MERCHANT_ID
+            },
+            body: JSON.stringify({
+                country: "NG",
+                reference: reference,
+                amount: {
+                    // OPay amounts are in kobo (smallest unit).
+                    total: Math.round(amountNaira * 100),
+                    currency: "NGN"
+                },
+                returnUrl: returnUrl,
+                callbackUrl: callbackUrl,
+                product: {
+                    name: "Kurios Stores",
+                    description: description || "Kurios Stores payment"
+                },
+                userInfo: {
+                    userName: customerName || "Kurios Student",
+                    userEmail: customerEmail || ""
+                }
+            }),
+            signal: AbortSignal.timeout(15000)
+        }
+    );
+
+    const data = await response.json();
+
+    if (data.code !== "00000") {
+
+        throw new Error(
+            "Could not start OPay checkout: " +
+            (data.message || "Unknown error")
+        );
+
+    }
+
+    return data.data;
+
+}
+
+
+// ========================================
+// QUERY AN OPAY PAYMENT'S STATUS
+// ========================================
+
+async function queryOpayPaymentStatus(reference) {
+
+    const payload = {
+        reference: reference,
+        country: "NG"
+    };
+
+    const signature =
+        signOpayPayload(payload);
+
+    const response = await fetch(
+        OPAY_BASE_URL + "/api/v1/international/cashier/status",
+        {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + signature,
+                "MerchantId": OPAY_MERCHANT_ID
+            },
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(15000)
+        }
+    );
+
+    const data = await response.json();
+
+    if (data.code !== "00000") {
+
+        throw new Error(
+            "Could not verify this payment with OPay: " +
+            (data.message || "Unknown error")
+        );
+
+    }
+
+    return data.data;
+
+}
+
+
+
+
+// ========================================
 // GET A MONNIFY ACCESS TOKEN
 // ========================================
 
@@ -670,6 +863,13 @@ async function ensureSellerPaymentColumnsExist() {
             `
             ALTER TABLE sellers
             ADD COLUMN IF NOT EXISTS transaction_reference TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE sellers
+            ADD COLUMN IF NOT EXISTS payment_gateway TEXT
             `
         );
 
@@ -3139,6 +3339,60 @@ app.post("/api/orders/webhook", async (req, res) => {
 
 
 // ========================================
+// OPAY WEBHOOK
+// (catches payments even if the student
+// closes the browser before we can verify —
+// we never trust the callback body's stated
+// status, we just use it to find the reference
+// and then re-check with OPay directly)
+// ========================================
+
+app.post("/api/opay/webhook", async (req, res) => {
+
+    try {
+
+        const paymentReference =
+            req.body &&
+            req.body.payload &&
+            req.body.payload.reference;
+
+        if (!paymentReference) {
+
+            return res.status(200).send("ignored");
+
+        }
+
+        if (paymentReference.startsWith("kurios_seller_")) {
+
+            await verifyAndUpdateSellerPayment(
+                paymentReference
+            );
+
+        } else {
+
+            await verifyAndUpdateOrder(
+                paymentReference
+            );
+
+        }
+
+        res.status(200).send("ok");
+
+    } catch (error) {
+
+        console.error(
+            "OPay webhook error:",
+            error.message
+        );
+
+        res.status(200).send("error logged");
+
+    }
+
+});
+
+
+// ========================================
 // LIST A STUDENT'S ORDERS
 // ========================================
 
@@ -3495,10 +3749,6 @@ app.post("/api/sellers/apply", async (req, res) => {
 
                 amount: Number(existing.application_fee),
 
-                apiKey: MONNIFY_API_KEY,
-
-                contractCode: MONNIFY_CONTRACT_CODE,
-
                 customerName:
                     `${student.first_name || ""} ${student.last_name || ""}`.trim(),
 
@@ -3559,17 +3809,13 @@ app.post("/api/sellers/apply", async (req, res) => {
             success: true,
 
             message:
-                "Pay the application fee to submit your application.",
+                "Choose a payment method to submit your application.",
 
             seller: result.rows[0],
 
             paymentReference: paymentReference,
 
             amount: applicationFee,
-
-            apiKey: MONNIFY_API_KEY,
-
-            contractCode: MONNIFY_CONTRACT_CODE,
 
             customerName:
                 `${student.first_name || ""} ${student.last_name || ""}`.trim(),
@@ -3596,8 +3842,208 @@ app.post("/api/sellers/apply", async (req, res) => {
 
 
 // ========================================
+// GET MONNIFY CHECKOUT DETAILS FOR A
+// SELLER APPLICATION FEE
+// ========================================
+
+app.post("/api/sellers/apply/pay/monnify", async (req, res) => {
+
+    try {
+
+        const { paymentReference } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const sellerResult = await pool.query(
+            `
+            SELECT sellers.*, students.first_name, students.last_name, students.email
+            FROM sellers
+            JOIN students ON students.id = sellers.student_id
+            WHERE sellers.payment_reference = $1
+            LIMIT 1
+            `,
+            [paymentReference]
+        );
+
+        if (sellerResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Seller application not found."
+            });
+
+        }
+
+        const seller = sellerResult.rows[0];
+
+        await pool.query(
+            `UPDATE sellers SET payment_gateway = 'monnify' WHERE id = $1`,
+            [seller.id]
+        );
+
+        res.status(200).json({
+
+            success: true,
+
+            paymentReference: paymentReference,
+
+            amount: Number(seller.application_fee),
+
+            apiKey: MONNIFY_API_KEY,
+
+            contractCode: MONNIFY_CONTRACT_CODE,
+
+            customerName:
+                `${seller.first_name || ""} ${seller.last_name || ""}`.trim(),
+
+            customerEmail: seller.email
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Seller Monnify checkout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not start Monnify checkout."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// GET OPAY CHECKOUT DETAILS FOR A
+// SELLER APPLICATION FEE
+// ========================================
+
+app.post("/api/sellers/apply/pay/opay", async (req, res) => {
+
+    try {
+
+        const { paymentReference, returnUrl } = req.body;
+
+        if (!paymentReference || !returnUrl) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference or return URL."
+            });
+
+        }
+
+        const sellerResult = await pool.query(
+            `
+            SELECT sellers.*, students.first_name, students.last_name, students.email
+            FROM sellers
+            JOIN students ON students.id = sellers.student_id
+            WHERE sellers.payment_reference = $1
+            LIMIT 1
+            `,
+            [paymentReference]
+        );
+
+        if (sellerResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Seller application not found."
+            });
+
+        }
+
+        const seller = sellerResult.rows[0];
+
+        const opayData =
+            await createOpayCashierPayment({
+                reference: paymentReference,
+                amountNaira: Number(seller.application_fee),
+                customerName:
+                    `${seller.first_name || ""} ${seller.last_name || ""}`.trim(),
+                customerEmail: seller.email,
+                description: "Kurios Stores seller application fee",
+                returnUrl: returnUrl,
+                callbackUrl: OPAY_CALLBACK_URL
+            });
+
+        await pool.query(
+            `UPDATE sellers SET payment_gateway = 'opay' WHERE id = $1`,
+            [seller.id]
+        );
+
+        res.status(200).json({
+
+            success: true,
+
+            cashierUrl: opayData.cashierUrl
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Seller OPay checkout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not start OPay checkout."
+        });
+
+    }
+
+});
+
+
+// ========================================
 // VERIFY A SELLER APPLICATION FEE PAYMENT
 // ========================================
+
+async function applySellerPaymentResult(seller, isPaid, isFailed, transactionReference, statusLabel) {
+
+    const updatedResult = await pool.query(
+        `
+        UPDATE sellers
+        SET
+            payment_status = $1,
+            status = $2,
+            transaction_reference = $3,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $4
+        RETURNING *
+        `,
+        [
+            isPaid ? "paid" : (isFailed ? "failed" : "unpaid"),
+            isPaid ? "pending" : "pending_payment",
+            transactionReference,
+            seller.id
+        ]
+    );
+
+    return {
+        success: isPaid,
+        message:
+            isPaid ?
+                "Payment confirmed. Your application is now under review." :
+                "Payment status: " + statusLabel,
+        seller: updatedResult.rows[0]
+    };
+
+}
+
 
 async function verifyAndUpdateSellerPayment(paymentReference) {
 
@@ -3633,6 +4079,54 @@ async function verifyAndUpdateSellerPayment(paymentReference) {
         };
 
     }
+
+
+    // ========================================
+    // OPAY
+    // ========================================
+
+    if (seller.payment_gateway === "opay") {
+
+        let opayData;
+
+        try {
+
+            opayData =
+                await queryOpayPaymentStatus(paymentReference);
+
+        } catch (error) {
+
+            return {
+                success: false,
+                message: "Could not verify this payment with OPay.",
+                seller: seller
+            };
+
+        }
+
+        const isPaid =
+            opayData.status === "SUCCESS" &&
+            Number(opayData.amount.total) >=
+                Math.round(Number(seller.application_fee) * 100);
+
+        const isFailed =
+            opayData.status === "FAIL" ||
+            opayData.status === "CLOSE";
+
+        return await applySellerPaymentResult(
+            seller,
+            isPaid,
+            isFailed,
+            opayData.orderNo,
+            opayData.status
+        );
+
+    }
+
+
+    // ========================================
+    // MONNIFY (default)
+    // ========================================
 
     const accessToken =
         await getMonnifyAccessToken();
@@ -3680,33 +4174,13 @@ async function verifyAndUpdateSellerPayment(paymentReference) {
         paymentStatus === "EXPIRED" ||
         paymentStatus === "REVERSED";
 
-    const updatedResult = await pool.query(
-        `
-        UPDATE sellers
-        SET
-            payment_status = $1,
-            status = $2,
-            transaction_reference = $3,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = $4
-        RETURNING *
-        `,
-        [
-            isPaid ? "paid" : (isFailed ? "failed" : "unpaid"),
-            isPaid ? "pending" : "pending_payment",
-            transactionReference,
-            seller.id
-        ]
+    return await applySellerPaymentResult(
+        seller,
+        isPaid,
+        isFailed,
+        transactionReference,
+        paymentStatus
     );
-
-    return {
-        success: isPaid,
-        message:
-            isPaid ?
-                "Payment confirmed. Your application is now under review." :
-                "Payment status: " + paymentStatus,
-        seller: updatedResult.rows[0]
-    };
 
 }
 
