@@ -1,2494 +1,5734 @@
-// ========================================
-// KURIOS STORES BACKEND
-// Express + PostgreSQL
-// ========================================
-
-require("dotenv").config();
-
-const dns = require("dns");
-
-dns.setDefaultResultOrder("ipv4first");
-
-const express = require("express");
-const cors = require("cors");
-const { Pool } = require("pg");
-const bcrypt = require("bcrypt");
-const nodemailer = require("nodemailer");
-const crypto = require("crypto");
-const path = require("path");
-const fs = require("fs");
-const multer = require("multer");
-
-const app = express();
-
-app.use(express.json());
+/* =========================================================
+   KURIOS STORES
+   MAIN JAVASCRIPT
+   ========================================================= */
 
 
-// ========================================
-// MONNIFY PAYMENT CONFIGURATION
-// ========================================
+/* =========================================================
+   1. BASIC SETTINGS
+   ========================================================= */
 
 /*
-    Put these in your .env file:
+    This is the address of our Node.js backend.
 
-    MONNIFY_API_KEY=...
-    MONNIFY_SECRET_KEY=...
-    MONNIFY_CONTRACT_CODE=...
-    MONNIFY_BASE_URL=https://sandbox.monnify.com
+    Our frontend is here:
 
-    Switch MONNIFY_BASE_URL to https://api.monnify.com
-    when you go live.
+    C:\Users\HomePC\Desktop\CODE WITH ELKURIOS\kurios-stores
+
+    Our backend is here:
+
+    C:\Users\HomePC\Desktop\kurios-stores-backend
 */
 
-const MONNIFY_API_KEY = process.env.MONNIFY_API_KEY;
-const MONNIFY_SECRET_KEY = process.env.MONNIFY_SECRET_KEY;
-const MONNIFY_CONTRACT_CODE = process.env.MONNIFY_CONTRACT_CODE;
-const MONNIFY_BASE_URL =
-    process.env.MONNIFY_BASE_URL ||
-    "https://sandbox.monnify.com";
+const API_URL = "https://kurios-stores-backend.onrender.com";
 
-
-// ========================================
-// GET A MONNIFY ACCESS TOKEN
-// ========================================
 
 /*
-    Monnify's API is protected by OAuth2.
-    We exchange our API key + secret key for
-    a short-lived access token, then use that
-    token (as a Bearer header) on every other
-    Monnify request.
+    Wait until the HTML has completely loaded
+    before JavaScript starts working.
 */
 
-async function getMonnifyAccessToken() {
+document.addEventListener("DOMContentLoaded", function () {
 
-    const credentials =
-        Buffer.from(
-            MONNIFY_API_KEY + ":" + MONNIFY_SECRET_KEY
-        ).toString("base64");
 
-    const response = await fetch(
-        MONNIFY_BASE_URL + "/api/v1/auth/login",
-        {
-            method: "POST",
-            headers: {
-                "Authorization": "Basic " + credentials,
-                "Content-Type": "application/json"
-            },
-            signal: AbortSignal.timeout(15000)
-        }
-    );
+    console.log("Kurios Stores website loaded successfully.");
 
-    const data = await response.json();
 
-    if (!data.requestSuccessful) {
 
-        throw new Error(
-            "Could not authenticate with Monnify: " +
-            (data.responseMessage || "Unknown error")
-        );
+    /* =====================================================
+       2. GET IMPORTANT HTML ELEMENTS
+       ===================================================== */
 
-    }
 
-    return data.responseBody.accessToken;
+    const productGrid =
+        document.getElementById("productGrid");
 
-}
 
+    const cartButton =
+        document.getElementById("cartButton");
 
-// ========================================
-// PROFILE PICTURE UPLOADS
-// ========================================
 
-/*
-    Uploaded profile pictures are saved to
-    an "uploads" folder next to this file,
-    and served back out at /uploads/<file>.
-*/
+    const cartOverlay =
+        document.getElementById("cartOverlay");
 
-const uploadsFolder = path.join(__dirname, "uploads");
 
-if (!fs.existsSync(uploadsFolder)) {
-    fs.mkdirSync(uploadsFolder);
-}
+    const closeCart =
+        document.getElementById("closeCart");
 
-app.use("/uploads", express.static(uploadsFolder));
 
-const profilePictureStorage = multer.diskStorage({
+    const cartItems =
+        document.getElementById("cartItems");
 
-    destination: function (req, file, cb) {
-        cb(null, uploadsFolder);
-    },
 
-    filename: function (req, file, cb) {
+    const cartCount =
+        document.getElementById("cartCount");
 
-        const uniqueSuffix =
-            Date.now() +
-            "-" +
-            crypto.randomInt(100000, 999999);
 
-        cb(
-            null,
-            "profile-" +
-                uniqueSuffix +
-                path.extname(file.originalname)
-        );
+    const cartTotal =
+        document.getElementById("cartTotal");
 
-    }
 
-});
+    const checkoutButton =
+        document.getElementById("checkoutButton");
 
-const profilePictureUpload = multer({
 
-    storage: profilePictureStorage,
 
-    limits: {
-        fileSize: 5 * 1024 * 1024 // 5MB max
-    },
+    /* =====================================================
+       3. SHOPPING CART
+       ===================================================== */
 
-    fileFilter: function (req, file, cb) {
 
-        const allowedTypes =
-            ["image/jpeg", "image/png", "image/webp"];
+    /*
+        The cart is stored in this array.
 
-        if (allowedTypes.includes(file.mimetype)) {
-            cb(null, true);
-        } else {
-            cb(new Error("Only JPG, PNG, or WEBP images are allowed."));
-        }
+        Example:
 
-    }
-
-});
-
-
-// ========================================
-// EMAIL CONFIGURATION
-// ========================================
-
-const emailTransporter = nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true,
-    family: 4,
-
-    connectionTimeout: 30000,
-    greetingTimeout: 30000,
-    socketTimeout: 30000,
-
-    tls: {
-        rejectUnauthorized: false
-    },
-
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASSWORD
-    }
-});
-
-emailTransporter.verify()
-    .then(() => {
-        console.log("Email server is ready.");
-    })
-    .catch((error) => {
-        console.error("Email configuration error:", error.message);
-    });
-
-// ========================================
-// MIDDLEWARE
-// ========================================
-
-app.use(cors());
-
-
-// =============================================
-// POSTGRESQL CONNECTION
-// =============================================
-
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: {
-        rejectUnauthorized: false
-    }
-});
-
-// ========================================
-// TEST DATABASE CONNECTION
-// ========================================
-
-pool.query("SELECT NOW()")
-    .then(() => {
-        console.log(
-            "Kurios Stores connected to PostgreSQL successfully."
-        );
-    })
-    .catch((error) => {
-        console.error(
-            "PostgreSQL connection failed:",
-            error.message
-        );
-    });
-
-
-// ========================================
-// AUTO-MIGRATE BASE TABLES
-// ========================================
-
-/*
-    Creates the core tables this app needs if
-    they don't already exist — so a brand new
-    database (like on a fresh Render deploy)
-    works without anyone running SQL by hand.
-    Existing tables/data are left untouched.
-*/
-
-async function ensureBaseTablesExist() {
-
-    try {
-
-        await pool.query(
-            `
-            CREATE TABLE IF NOT EXISTS students (
-                id SERIAL PRIMARY KEY,
-                first_name TEXT NOT NULL,
-                last_name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                phone TEXT,
-                whatsapp_number TEXT,
-                university TEXT,
-                student_id TEXT,
-                password_hash TEXT NOT NULL,
-                agreed_terms BOOLEAN DEFAULT false,
-                agreed_privacy BOOLEAN DEFAULT false,
-                receive_notifications BOOLEAN DEFAULT true,
-                email_verified BOOLEAN DEFAULT false,
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW()
-            )
-            `
-        );
-
-        await pool.query(
-            `
-            CREATE TABLE IF NOT EXISTS student_verification_codes (
-                id SERIAL PRIMARY KEY,
-                student_id INTEGER REFERENCES students(id),
-                otp TEXT NOT NULL,
-                expires_at TIMESTAMP NOT NULL,
-                verified BOOLEAN DEFAULT false,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-            `
-        );
-
-        await pool.query(
-            `
-            CREATE TABLE IF NOT EXISTS products (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                price NUMERIC(12, 2) NOT NULL,
-                image_url TEXT,
-                category TEXT,
-                stock_quantity INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-            `
-        );
-
-        console.log(
-            "Base tables (students, student_verification_codes, products) are ready."
-        );
-
-    } catch (error) {
-
-        console.error(
-            "Could not create base tables:",
-            error.message
-        );
-
-    }
-
-}
-
-
-// ========================================
-// AUTO-MIGRATE NEW PROFILE COLUMNS
-// ========================================
-
-/*
-    Adds the date_of_birth and profile_picture
-    columns to the students table if they don't
-    already exist yet, so nothing needs to be
-    run manually in psql.
-*/
-
-async function ensureProfileColumnsExist() {
-
-    try {
-
-        await pool.query(
-            `
-            ALTER TABLE students
-            ADD COLUMN IF NOT EXISTS date_of_birth DATE
-            `
-        );
-
-        await pool.query(
-            `
-            ALTER TABLE students
-            ADD COLUMN IF NOT EXISTS profile_picture TEXT
-            `
-        );
-
-        console.log(
-            "Profile columns (date_of_birth, profile_picture) are ready."
-        );
-
-    } catch (error) {
-
-        console.error(
-            "Could not add profile columns:",
-            error.message
-        );
-
-    }
-
-}
-
-
-// ========================================
-// AUTO-MIGRATE ORDERS TABLE
-// ========================================
-
-async function ensureOrdersTableExists() {
-
-    try {
-
-        await pool.query(
-            `
-            CREATE TABLE IF NOT EXISTS orders (
-                id SERIAL PRIMARY KEY,
-                student_id INTEGER REFERENCES students(id),
-                payment_reference TEXT UNIQUE NOT NULL,
-                transaction_reference TEXT,
-                items JSONB NOT NULL,
-                amount NUMERIC(12, 2) NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW()
-            )
-            `
-        );
-
-        console.log(
-            "Orders table is ready."
-        );
-
-    } catch (error) {
-
-        console.error(
-            "Could not create orders table:",
-            error.message
-        );
-
-    }
-
-}
-
-
-// ========================================
-// RUN ALL MIGRATIONS, IN ORDER
-// ========================================
-
-/*
-    These run one after another (not all at
-    once) because later ones depend on earlier
-    ones — the orders table references students,
-    and the profile columns are added onto
-    students, so students has to exist first.
-*/
-
-async function runMigrations() {
-
-    await ensureBaseTablesExist();
-    await ensureProfileColumnsExist();
-    await ensureOrdersTableExists();
-
-}
-
-runMigrations();
-
-
-// ========================================
-// HOME ROUTE
-// ========================================
-
-app.get("/", (req, res) => {
-
-    res.send("Kurios Stores Backend is Working!");
-
-});
-
-
-// ========================================
-// GET PRODUCTS
-// ========================================
-
-app.get("/api/products", async (req, res) => {
-
-    try {
-
-        const result = await pool.query(
-            "SELECT * FROM products ORDER BY id ASC"
-        );
-
-        res.json(result.rows);
-
-    } catch (error) {
-
-        console.error(
-            "Error fetching products:",
-            error.message
-        );
-
-        res.status(500).json({
-            error: "Unable to retrieve products"
-        });
-
-    }
-
-});
-
-
-// ========================================
-// STUDENT REGISTRATION
-// ========================================
-
-app.post("/api/students/register", async (req, res) => {
-
-    try {
-
-        const {
-            firstName,
-            lastName,
-            email,
-            phone,
-            whatsappNumber,
-            university,
-            studentId,
-            password,
-            confirmPassword,
-            agreedStudent,
-            agreedTerms,
-            agreedPrivacy,
-            receiveNotifications
-        } = req.body;
-
-
-        // ====================================
-        // REQUIRED FIELD VALIDATION
-        // ====================================
-
-        if (
-            !firstName ||
-            !lastName ||
-            !email ||
-            !phone ||
-            !university ||
-            !studentId ||
-            !password ||
-            !confirmPassword
-        ) {
-
-            return res.status(400).json({
-                success: false,
-                message: "Please fill in all required fields."
-            });
-
-        }
-
-
-        // ====================================
-        // PASSWORD MATCH
-        // ====================================
-
-        if (password !== confirmPassword) {
-
-            return res.status(400).json({
-                success: false,
-                message: "Passwords do not match."
-            });
-
-        }
-
-
-        // ====================================
-        // STUDENT CONFIRMATION
-        // ====================================
-
-        if (!agreedStudent) {
-
-            return res.status(400).json({
-                success: false,
-                message: "Please confirm that you are a student."
-            });
-
-        }
-
-
-        // ====================================
-        // TERMS & PRIVACY
-        // ====================================
-
-        if (!agreedTerms || !agreedPrivacy) {
-
-            return res.status(400).json({
-                success: false,
-                message:
-                    "You must agree to the Terms and Privacy Policy."
-            });
-
-        }
-
-
-        // ====================================
-// CHECK EXISTING EMAIL
-// ====================================
-
-const emailCheck = await pool.query(
-    `
-    SELECT
-        id,
-        first_name,
-        last_name,
-        email,
-        phone,
-        whatsapp_number,
-        university,
-        student_id,
-        password_hash,
-        agreed_terms,
-        agreed_privacy,
-        receive_notifications,
-        email_verified
-    FROM students
-    WHERE LOWER(email) = LOWER($1)
-    LIMIT 1
-    `,
-    [email.trim()]
-);
-
-
-// ====================================
-// EXISTING EMAIL FOUND
-// ====================================
-
-if (emailCheck.rows.length > 0) {
-
-    const existingStudent =
-        emailCheck.rows[0];
-
-
-    // ====================================
-    // VERIFIED ACCOUNT ALREADY EXISTS
-    // ====================================
-
-    if (existingStudent.email_verified) {
-
-        return res.status(409).json({
-
-            success: false,
-
-            message:
-                "An account with this email already exists. Please log in instead."
-
-        });
-
-    }
-
-
-    // ====================================
-    // UNVERIFIED REGISTRATION
-    // ====================================
-
-    console.log(
-        "Unverified registration found. Continuing registration:",
-        existingStudent.email
-    );
-
-
-    // ====================================
-    // CHECK STUDENT ID
-    // AGAINST OTHER ACCOUNTS
-    // ====================================
-
-    const studentIdCheck =
-        await pool.query(
-            `
-            SELECT id
-            FROM students
-            WHERE university = $1
-            AND student_id = $2
-            AND id <> $3
-            LIMIT 1
-            `,
-            [
-                university.trim(),
-                studentId.trim(),
-                existingStudent.id
-            ]
-        );
-
-
-    if (studentIdCheck.rows.length > 0) {
-
-        return res.status(409).json({
-
-            success: false,
-
-            message:
-                "This student ID is already registered for this institution."
-
-        });
-
-    }
-
-
-    // ====================================
-    // HASH NEW PASSWORD
-    // ====================================
-
-    const passwordHash =
-        await bcrypt.hash(
-            password,
-            12
-        );
-
-
-    // ====================================
-    // UPDATE PENDING REGISTRATION
-    // ====================================
-
-    const updatedStudent =
-        await pool.query(
-            `
-            UPDATE students
-            SET
-                first_name = $1,
-                last_name = $2,
-                phone = $3,
-                whatsapp_number = $4,
-                university = $5,
-                student_id = $6,
-                password_hash = $7,
-                agreed_terms = $8,
-                agreed_privacy = $9,
-                receive_notifications = $10,
-                email_verified = false,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $11
-            RETURNING
-                id,
-                first_name,
-                last_name,
-                email,
-                phone,
-                whatsapp_number,
-                university,
-                student_id,
-                date_of_birth,
-                profile_picture
-            `,
-            [
-                firstName.trim(),
-                lastName.trim(),
-                phone.trim(),
-                whatsappNumber
-                    ? whatsappNumber.trim()
-                    : null,
-                university.trim(),
-                studentId.trim(),
-                passwordHash,
-                agreedTerms,
-                agreedPrivacy,
-                receiveNotifications !== false,
-                existingStudent.id
-            ]
-        );
-
-
-    // ====================================
-    // GENERATE NEW OTP
-    // ====================================
-
-    const otp =
-        crypto
-            .randomInt(
-                100000,
-                1000000
-            )
-            .toString();
-
-
-    const expiresAt =
-        new Date(
-            Date.now() +
-            10 * 60 * 1000
-        );
-
-
-    // ====================================
-    // REMOVE OLD OTP
-    // ====================================
-
-    await pool.query(
-        `
-        DELETE FROM student_verification_codes
-        WHERE student_id = $1
-        AND verified = false
-        `,
         [
-            existingStudent.id
+            {
+                id: 1,
+                name: "Instant Noodles",
+                price: 1200,
+                quantity: 2
+            }
         ]
-    );
+    */
+
+    let cart = JSON.parse(
+        localStorage.getItem("kuriosCart")
+    ) || [];
 
 
-    // ====================================
-    // SAVE NEW OTP
-    // ====================================
 
-    await pool.query(
-        `
-        INSERT INTO student_verification_codes
-        (
-            student_id,
-            otp,
-            expires_at
-        )
-        VALUES
-        ($1, $2, $3)
-        `,
-        [
-            existingStudent.id,
-            otp,
-            expiresAt
-        ]
-    );
+    /*
+        Save the cart in the browser.
+
+        This means refreshing the page
+        won't immediately empty the cart.
+    */
+
+    function saveCart() {
+
+        localStorage.setItem(
+            "kuriosCart",
+            JSON.stringify(cart)
+        );
+
+    }
 
 
-    // ====================================
-    // SEND NEW VERIFICATION EMAIL
-    // ====================================
 
-    await emailTransporter.sendMail({
+    /*
+        Format Nigerian currency.
+    */
 
-        from:
-            `"Kurios Stores" <${process.env.EMAIL_USER}>`,
+    function formatMoney(amount) {
 
-        to:
-            updatedStudent.rows[0].email,
+        return "₦" + Number(amount).toLocaleString();
 
-        subject:
-            "Continue Your Kurios Stores Registration",
+    }
 
-        html: `
-            <div style="
-                font-family: Arial, sans-serif;
-                max-width: 600px;
-                margin: 0 auto;
-                padding: 30px;
-                border: 1px solid #e5e7eb;
-                border-radius: 12px;
-            ">
 
-                <h2 style="
-                    color: #5b21b6;
-                ">
-                    Continue Your Kurios Stores Registration
-                </h2>
 
-                <p>
-                    Hello
-                    <strong>
-                        ${updatedStudent.rows[0].first_name}
-                    </strong>,
-                </p>
+    /* =====================================================
+       4. DISPLAY CART
+       ===================================================== */
 
-                <p>
-                    We found an unfinished Kurios Stores
-                    registration using this email address.
-                </p>
 
-                <p>
-                    You can continue your registration.
-                    Enter the verification code below
-                    to activate your account.
-                </p>
+    function updateCart() {
 
-                <div style="
-                    margin: 25px 0;
-                    padding: 20px;
-                    text-align: center;
-                    background: #f3f0ff;
-                    border-radius: 10px;
-                ">
 
-                    <span style="
-                        font-size: 32px;
-                        font-weight: bold;
-                        letter-spacing: 8px;
-                        color: #5b21b6;
-                    ">
-                        ${otp}
-                    </span>
+        /*
+            Make sure the cart container exists.
+        */
+
+        if (!cartItems) {
+            return;
+        }
+
+
+        /*
+            Empty the current cart display.
+        */
+
+        cartItems.innerHTML = "";
+
+
+
+        /*
+            If there are no products...
+        */
+
+        if (cart.length === 0) {
+
+            cartItems.innerHTML = `
+
+                <div class="empty-cart">
+
+                    <i class="fa-solid fa-cart-shopping"></i>
+
+                    <h3>
+                        Your cart is empty
+                    </h3>
+
+                    <p>
+                        Add some products to get started.
+                    </p>
 
                 </div>
 
-                <p>
-                    This verification code will expire
-                    in <strong>10 minutes</strong>.
-                </p>
+            `;
 
-                <p>
-                    If you did not attempt to register
-                    with Kurios Stores, you can ignore
-                    this email.
-                </p>
-
-                <br>
-
-                <p>
-                    Regards,<br>
-                    <strong>Kurios Stores</strong>
-                </p>
-
-            </div>
-        `
-
-    });
+        }
 
 
-    // ====================================
-    // CONTINUE REGISTRATION
-    // ====================================
 
-    return res.status(200).json({
+        /*
+            Otherwise display the products.
+        */
 
-        success: true,
+        else {
 
-        requiresVerification: true,
-
-        continueRegistration: true,
-
-        message:
-            "We found an unfinished registration for this email. Your registration has been continued and a new verification code has been sent.",
-
-        studentId:
-            updatedStudent.rows[0].id,
-
-        email:
-            updatedStudent.rows[0].email,
-
-        student:
-            updatedStudent.rows[0]
-
-    });
-
-}
+            cart.forEach(function (item, index) {
 
 
-        // ====================================
-        // CHECK STUDENT ID
-        // ====================================
+                const itemTotal =
+                    item.price * item.quantity;
 
-        const studentCheck = await pool.query(
-            `
-            SELECT id
-            FROM students
-            WHERE university = $1
-            AND student_id = $2
-            `,
-            [
-                university.trim(),
-                studentId.trim()
-            ]
-        );
 
-        if (studentCheck.rows.length > 0) {
+                cartItems.innerHTML += `
 
-            return res.status(409).json({
-                success: false,
-                message:
-                    "This student ID is already registered for this institution."
+                    <div class="cart-item">
+
+
+                        <div class="cart-item-image">
+
+                            <i class="fa-solid fa-bag-shopping"></i>
+
+                        </div>
+
+
+
+                        <div class="cart-item-info">
+
+                            <h3>
+                                ${item.name}
+                            </h3>
+
+
+                            <div class="cart-item-price">
+
+                                ${formatMoney(item.price)}
+
+                            </div>
+
+
+
+                            <div class="quantity-controls">
+
+
+                                <button
+                                    class="quantity-button"
+                                    data-action="decrease"
+                                    data-index="${index}"
+                                >
+                                    −
+                                </button>
+
+
+                                <strong>
+                                    ${item.quantity}
+                                </strong>
+
+
+                                <button
+                                    class="quantity-button"
+                                    data-action="increase"
+                                    data-index="${index}"
+                                >
+                                    +
+                                </button>
+
+
+                                <button
+                                    class="remove-item"
+                                    data-action="remove"
+                                    data-index="${index}"
+                                >
+                                    Remove
+                                </button>
+
+
+                            </div>
+
+
+                        </div>
+
+
+
+                        <strong>
+
+                            ${formatMoney(itemTotal)}
+
+                        </strong>
+
+
+                    </div>
+
+                `;
+
             });
 
         }
 
 
-        // ====================================
-        // HASH PASSWORD
-        // ====================================
 
-        const passwordHash = await bcrypt.hash(
-            password,
-            12
+        /*
+            Calculate total number of items.
+        */
+
+        let totalQuantity = 0;
+
+
+        cart.forEach(function (item) {
+
+            totalQuantity += item.quantity;
+
+        });
+
+
+
+        /*
+            Update cart badge.
+        */
+
+        if (cartCount) {
+
+            cartCount.textContent =
+                totalQuantity;
+
+        }
+
+
+
+        /*
+            Calculate total price.
+        */
+
+        let totalPrice = 0;
+
+
+        cart.forEach(function (item) {
+
+            totalPrice +=
+                item.price * item.quantity;
+
+        });
+
+
+
+        /*
+            Display total price.
+        */
+
+        if (cartTotal) {
+
+            cartTotal.textContent =
+                formatMoney(totalPrice);
+
+        }
+
+    }
+
+
+
+    /* =====================================================
+       5. ADD PRODUCT TO CART
+       ===================================================== */
+
+
+    function addToCart(product) {
+
+
+        /*
+            Check whether the product
+            already exists in the cart.
+        */
+
+        const existingProduct =
+            cart.find(function (item) {
+
+                return item.id === product.id;
+
+            });
+
+
+
+        /*
+            If it already exists,
+            increase quantity.
+        */
+
+        if (existingProduct) {
+
+            existingProduct.quantity += 1;
+
+        }
+
+
+
+        /*
+            Otherwise add a new product.
+        */
+
+        else {
+
+            cart.push({
+
+                id: product.id,
+
+                name: product.name,
+
+                price: Number(product.price),
+
+                quantity: 1
+
+            });
+
+        }
+
+
+
+        /*
+            Save cart.
+        */
+
+        saveCart();
+
+
+        /*
+            Update display.
+        */
+
+        updateCart();
+
+
+        /*
+            Open cart.
+        */
+
+        openCart();
+
+
+        /*
+            Show confirmation.
+        */
+
+        showMessage(
+            product.name + " added to your cart."
+        );
+
+    }
+
+
+
+    /* =====================================================
+       6. CART BUTTON
+       ===================================================== */
+
+
+    function openCart() {
+
+        if (cartOverlay) {
+
+            cartOverlay.classList.add("open");
+
+        }
+
+    }
+
+
+
+    function closeCartPanel() {
+
+        if (cartOverlay) {
+
+            cartOverlay.classList.remove("open");
+
+        }
+
+    }
+
+
+
+    if (cartButton) {
+
+        cartButton.addEventListener(
+            "click",
+            openCart
+        );
+
+    }
+
+
+
+    if (closeCart) {
+
+        closeCart.addEventListener(
+            "click",
+            closeCartPanel
+        );
+
+    }
+
+
+
+    /*
+        Clicking outside the cart
+        closes it.
+    */
+
+    if (cartOverlay) {
+
+        cartOverlay.addEventListener(
+            "click",
+            function (event) {
+
+                if (
+                    event.target === cartOverlay
+                ) {
+
+                    closeCartPanel();
+
+                }
+
+            }
+        );
+
+    }
+
+
+
+    /* =====================================================
+       7. CART QUANTITY BUTTONS
+       ===================================================== */
+
+
+    if (cartItems) {
+
+        cartItems.addEventListener(
+            "click",
+            function (event) {
+
+
+                const button =
+                    event.target.closest("button");
+
+
+                if (!button) {
+                    return;
+                }
+
+
+                const action =
+                    button.dataset.action;
+
+
+                const index =
+                    Number(button.dataset.index);
+
+
+
+                /*
+                    Increase quantity.
+                */
+
+                if (action === "increase") {
+
+                    cart[index].quantity += 1;
+
+                }
+
+
+
+                /*
+                    Decrease quantity.
+                */
+
+                if (action === "decrease") {
+
+                    cart[index].quantity -= 1;
+
+
+                    /*
+                        Remove product when
+                        quantity reaches zero.
+                    */
+
+                    if (
+                        cart[index].quantity <= 0
+                    ) {
+
+                        cart.splice(index, 1);
+
+                    }
+
+                }
+
+
+
+                /*
+                    Remove product.
+                */
+
+                if (action === "remove") {
+
+                    cart.splice(index, 1);
+
+                }
+
+
+
+                saveCart();
+
+                updateCart();
+
+            }
+        );
+
+    }
+
+
+
+    /* =====================================================
+       8. LOAD PRODUCTS FROM NODE BACKEND
+       ===================================================== */
+
+
+    async function loadProducts() {
+
+
+        /*
+            Tell the browser:
+
+            "Go to my backend and
+             ask for the products."
+        */
+
+        try {
+
+
+            const response =
+                await fetch(
+                    API_URL + "/api/products"
+                );
+
+
+
+            /*
+                Check whether the backend
+                responded successfully.
+            */
+
+            if (!response.ok) {
+
+                throw new Error(
+                    "Backend returned an error."
+                );
+
+            }
+
+
+
+            /*
+                Convert the response
+                into JavaScript data.
+            */
+
+            const products =
+                await response.json();
+
+
+
+            console.log(
+                "Products from Kurios Backend:",
+                products
+            );
+
+
+
+            /*
+                Display products
+                on the website.
+            */
+
+            displayProducts(products);
+
+
+        }
+
+
+        catch (error) {
+
+
+            console.error(
+                "Error connecting to backend:",
+                error
+            );
+
+
+
+            /*
+                Tell the user that
+                the backend isn't available.
+            */
+
+            if (productGrid) {
+
+                productGrid.innerHTML = `
+
+                    <div class="empty-state">
+
+                        <i class="fa-solid fa-triangle-exclamation"></i>
+
+                        <h3>
+                            Products could not be loaded
+                        </h3>
+
+                        <p>
+                            Please make sure the Kurios Stores
+                            backend is running.
+                        </p>
+
+                    </div>
+
+                `;
+
+            }
+
+        }
+
+    }
+
+
+
+    /* =====================================================
+       9. DISPLAY PRODUCTS
+       ===================================================== */
+
+
+    function displayProducts(products) {
+
+
+        if (!productGrid) {
+            return;
+        }
+
+
+        /*
+            Remove the old hard-coded products.
+        */
+
+        productGrid.innerHTML = "";
+
+
+
+        /*
+            If there are no products.
+        */
+
+        if (
+            !products ||
+            products.length === 0
+        ) {
+
+            productGrid.innerHTML = `
+
+                <div class="empty-state">
+
+                    <i class="fa-solid fa-box-open"></i>
+
+                    <h3>
+                        No products available
+                    </h3>
+
+                    <p>
+                        Please check back later.
+                    </p>
+
+                </div>
+
+            `;
+
+            return;
+
+        }
+
+
+
+        /*
+            Go through each product.
+        */
+
+        products.forEach(function (product) {
+
+
+            /*
+                Determine a category
+                for our current test products.
+            */
+
+            let category = "Food";
+
+            let icon =
+                "fa-utensils";
+
+
+            if (
+                product.name
+                    .toLowerCase()
+                    .includes("water")
+            ) {
+
+                category = "Food";
+
+                icon =
+                    "fa-bottle-water";
+
+            }
+
+
+            else if (
+                product.name
+                    .toLowerCase()
+                    .includes("noodle")
+            ) {
+
+                category = "Food";
+
+                icon =
+                    "fa-bowl-food";
+
+            }
+
+
+            else if (
+                product.name
+                    .toLowerCase()
+                    .includes("biscuit")
+            ) {
+
+                category = "Food";
+
+                icon =
+                    "fa-cookie-bite";
+
+            }
+
+
+
+            /*
+                Create the product card.
+            */
+
+            const productCard =
+                document.createElement("article");
+
+
+            productCard.className =
+                "product-card";
+
+
+            productCard.dataset.category =
+                category;
+
+
+
+            productCard.innerHTML = `
+
+                <div class="product-image">
+
+                    <i class="fa-solid ${icon}"></i>
+
+                </div>
+
+
+                <div class="product-info">
+
+
+                    <span class="product-category">
+
+                        ${category}
+
+                    </span>
+
+
+                    <h3>
+
+                        ${product.name}
+
+                    </h3>
+
+
+                    <p>
+
+                        Available at
+                        Kurios Stores.
+
+                    </p>
+
+
+                    <div class="product-bottom">
+
+
+                        <strong>
+
+                            ${formatMoney(product.price)}
+
+                        </strong>
+
+
+                        <button
+
+                            class="add-to-cart"
+
+                            data-product-id="${product.id}"
+
+                        >
+
+                            <i class="fa-solid fa-plus"></i>
+
+                            Add
+
+                        </button>
+
+
+                    </div>
+
+
+                </div>
+
+            `;
+
+
+
+            /*
+                Put the card inside
+                the product grid.
+            */
+
+            productGrid.appendChild(
+                productCard
+            );
+
+
+
+            /*
+                Add click event to
+                the Add button.
+            */
+
+            const addButton =
+                productCard.querySelector(
+                    ".add-to-cart"
+                );
+
+
+            addButton.addEventListener(
+                "click",
+                function () {
+
+                    addToCart(product);
+
+                }
+            );
+
+        });
+
+    }
+
+
+
+    /* =====================================================
+       10. PRODUCT FILTERS
+       ===================================================== */
+
+
+    const filterButtons =
+        document.querySelectorAll(
+            ".filter-button"
         );
 
 
-        // ====================================
-        // SAVE STUDENT
-        // ====================================
 
-        const result = await pool.query(
-            `
-            INSERT INTO students (
-                first_name,
-                last_name,
-                email,
-                phone,
-                whatsapp_number,
-                university,
-                student_id,
-                password_hash,
-                agreed_terms,
-                agreed_privacy,
-                receive_notifications,
-                email_verified
-            )
-            VALUES (
-                $1,
-                $2,
-                $3,
-                $4,
-                $5,
-                $6,
-                $7,
-                $8,
-                $9,
-                $10,
-                $11,
-                false
-            )
-            RETURNING
-                id,
-                first_name,
-                last_name,
-                email,
-                phone,
-                whatsapp_number,
-                university,
-                student_id,
-                date_of_birth,
-                profile_picture,
-                created_at
-            `,
-            [
-                firstName.trim(),
-                lastName.trim(),
-                email.trim(),
-                phone.trim(),
-                whatsappNumber
-                    ? whatsappNumber.trim()
-                    : null,
-                university.trim(),
-                studentId.trim(),
-                passwordHash,
-                agreedTerms,
-                agreedPrivacy,
-                receiveNotifications !== false
-            ]
+    filterButtons.forEach(
+        function (button) {
+
+
+            button.addEventListener(
+                "click",
+                function () {
+
+
+                    /*
+                        Remove active state
+                        from all buttons.
+                    */
+
+                    filterButtons.forEach(
+                        function (item) {
+
+                            item.classList.remove(
+                                "active"
+                            );
+
+                        }
+                    );
+
+
+
+                    /*
+                        Activate clicked button.
+                    */
+
+                    button.classList.add(
+                        "active"
+                    );
+
+
+
+                    const selectedCategory =
+                        button.dataset.filter;
+
+
+
+                    const productCards =
+                        document.querySelectorAll(
+                            ".product-card"
+                        );
+
+
+
+                    productCards.forEach(
+                        function (card) {
+
+
+                            if (
+                                selectedCategory ===
+                                "all"
+                            ) {
+
+                                card.style.display =
+                                    "";
+
+                                return;
+
+                            }
+
+
+
+                            if (
+                                card.dataset.category ===
+                                selectedCategory
+                            ) {
+
+                                card.style.display =
+                                    "";
+
+                            }
+
+                            else {
+
+                                card.style.display =
+                                    "none";
+
+                            }
+
+                        }
+                    );
+
+                }
+            );
+
+        }
+    );
+
+
+
+    /* =====================================================
+       11. CATEGORY CARDS
+       ===================================================== */
+
+
+    const categoryCards =
+        document.querySelectorAll(
+            ".category-card"
         );
 
 
-// ====================================
-// GENERATE EMAIL VERIFICATION OTP
-// ====================================
+    categoryCards.forEach(
+        function (card) {
 
-const otp = crypto
-    .randomInt(100000, 1000000)
-    .toString();
+            card.addEventListener(
+                "click",
+                function () {
 
-const expiresAt = new Date(
-    Date.now() + 10 * 60 * 1000
+
+                    const category =
+                        card.dataset.category;
+
+
+                    /*
+                        Find matching shop filter.
+                    */
+
+                    const filter =
+                        document.querySelector(
+                            `.filter-button[data-filter="${category}"]`
+                        );
+
+
+                    if (filter) {
+
+                        filter.click();
+
+                    }
+
+
+                    /*
+                        Scroll to shop.
+                    */
+
+                    const shop =
+                        document.getElementById(
+                            "shop"
+                        );
+
+
+                    if (shop) {
+
+                        shop.scrollIntoView({
+                            behavior: "smooth"
+                        });
+
+                    }
+
+                }
+            );
+
+        }
+    );
+
+// ========================================
+// UPDATE HEADER LOGIN STATE
+// ========================================
+
+function updateLoginState() {
+
+        // ========================================
+    // HERO LOGIN STATE
+    // ========================================
+
+    const loggedOutHero =
+        document.getElementById("loggedOutHero");
+
+    const loggedInHero =
+        document.getElementById("loggedInHero");
+
+    const heroStudentName =
+        document.getElementById("heroStudentName");
+
+    const heroStudentCampus =
+        document.getElementById("heroStudentCampus");
+
+    const signInButton =
+        document.getElementById("openSignIn");
+
+    if (!signInButton) {
+        return;
+    }
+
+
+    // ========================================
+    // GET LOGGED-IN STUDENT
+    // ========================================
+
+    let storedStudent =
+        localStorage.getItem("kuriosLoggedInStudent");
+
+    if (!storedStudent) {
+
+        storedStudent =
+            sessionStorage.getItem(
+                "kuriosLoggedInStudent"
+            );
+
+    }
+
+
+    // ========================================
+    // STUDENT IS NOT LOGGED IN
+    // ========================================
+
+    if (!storedStudent) {
+
+    signInButton.innerHTML = `
+        <i class="fa-regular fa-user"></i>
+
+        <span>
+            Sign In
+        </span>
+    `;
+
+
+    // ========================================
+    // SHOW LOGGED-OUT HERO
+    // ========================================
+
+    const loggedOutHero =
+        document.getElementById("loggedOutHero");
+
+    const loggedInHero =
+        document.getElementById("loggedInHero");
+
+
+    if (loggedOutHero) {
+
+        loggedOutHero.style.display =
+            "block";
+
+    }
+
+
+    if (loggedInHero) {
+
+        loggedInHero.style.display =
+            "none";
+
+    }
+
+
+    return;
+
+}
+
+
+    // ========================================
+    // READ STUDENT DATA
+    // ========================================
+
+    let student;
+
+    try {
+
+        student =
+            JSON.parse(storedStudent);
+
+    } catch (error) {
+
+        console.error(
+            "Unable to read logged-in student:",
+            error
+        );
+
+        return;
+
+    }
+
+
+    // ========================================
+    // UPDATE HERO FOR LOGGED-IN STUDENT
+    // ========================================
+
+
+    // ========================================
+    // HIDE LOGGED-OUT HERO
+    // ========================================
+
+    if (loggedOutHero) {
+
+        loggedOutHero.style.display =
+            "none";
+
+    }
+
+    // ========================================
+    // SHOW LOGGED-IN HERO
+    // ========================================
+
+    if (loggedInHero) {
+
+        loggedInHero.style.display =
+            "block";
+
+    }
+
+
+    // ========================================
+    // STUDENT NAME
+    // ========================================
+
+    if (heroStudentName) {
+
+        heroStudentName.textContent =
+            student.first_name ||
+            student.firstName ||
+            "Student";
+
+    }
+
+
+    // ========================================
+    // STUDENT INFORMATION
+    // ========================================
+
+    if (heroStudentCampus) {
+
+        const university =
+            student.university ||
+            "";
+
+        const studentId =
+            student.student_id ||
+            student.studentId ||
+            "";
+
+
+        if (university) {
+
+            heroStudentCampus.textContent =
+                university;
+
+        } else if (studentId) {
+
+            heroStudentCampus.textContent =
+                studentId;
+
+        } else {
+
+            heroStudentCampus.textContent =
+                "Your campus";
+
+        }
+
+    }
+
+
+    // ========================================
+    // ACTIVE ORDERS
+    // ========================================
+
+    refreshOrderCountBadge(student.id);
+
+
+    // ========================================
+    // GET DISPLAY NAME
+    // ========================================
+
+    const firstName =
+        student.first_name || "";
+
+    const lastName =
+        student.last_name || "";
+
+    const displayName =
+        firstName ||
+        lastName ||
+        "Account";
+
+
+    // ========================================
+    // UPDATE HEADER
+    // ========================================
+
+    signInButton.innerHTML = `
+        <i class="fa-regular fa-user"></i>
+
+        <span>
+            ${displayName}
+        </span>
+    `;
+
+}
+
+// ========================================
+// CHECK LOGIN STATE
+// ========================================
+
+updateLoginState();
+
+    /* =====================================================
+       12. SIGN IN MODAL
+       ===================================================== */
+
+
+    const openSignIn =
+        document.getElementById(
+            "openSignIn"
+        );
+
+
+    const signInModal =
+        document.getElementById(
+            "signInModal"
+        );
+
+
+    const closeSignIn =
+        document.getElementById(
+            "closeSignIn"
+        );
+
+
+    const signInForm =
+        document.getElementById(
+            "signinForm"
+        );
+
+
+
+    function openSignInModal() {
+
+        if (signInModal) {
+
+            signInModal.classList.add(
+                "open"
+            );
+
+        }
+
+    }
+
+
+
+    function closeSignInModal() {
+
+        if (signInModal) {
+
+            signInModal.classList.remove(
+                "open"
+            );
+
+        }
+
+    }
+
+
+
+    // ========================================
+// STUDENT ACCOUNT / SIGN IN BUTTON
+// ========================================
+
+const studentAccountMenu =
+    document.getElementById(
+        "studentAccountMenu"
+    );
+
+
+if (openSignIn) {
+
+    openSignIn.addEventListener(
+        "click",
+        function (event) {
+
+            event.stopPropagation();
+
+
+            // ========================================
+            // CHECK LOGIN STATE
+            // ========================================
+
+            const loggedInStudent =
+                localStorage.getItem(
+                    "kuriosLoggedInStudent"
+                ) ||
+                sessionStorage.getItem(
+                    "kuriosLoggedInStudent"
+                );
+
+
+            // ========================================
+            // NOT LOGGED IN
+            // ========================================
+
+            if (!loggedInStudent) {
+
+                if (studentAccountMenu) {
+
+                    studentAccountMenu.classList.remove(
+                        "open"
+                    );
+
+                }
+
+                openSignInModal();
+
+                return;
+
+            }
+
+
+            // ========================================
+            // LOGGED IN
+            // ========================================
+
+            if (studentAccountMenu) {
+
+                studentAccountMenu.classList.toggle(
+                    "open"
+                );
+
+            }
+
+        }
+    );
+
+}
+
+
+// ========================================
+// CLOSE ACCOUNT MENU WHEN CLICKING OUTSIDE
+// ========================================
+
+document.addEventListener(
+    "click",
+    function (event) {
+
+        if (!studentAccountMenu) {
+            return;
+        }
+
+
+        if (
+            !studentAccountMenu.contains(event.target) &&
+            event.target !== openSignIn &&
+            !openSignIn.contains(event.target)
+        ) {
+
+            studentAccountMenu.classList.remove(
+                "open"
+            );
+
+        }
+
+    }
 );
 
+// ========================================
+// GET CURRENTLY LOGGED-IN STUDENT
+// ========================================
 
-// ====================================
-// REMOVE OLD OTP CODES
-// ====================================
+function getLoggedInStudent() {
 
-await pool.query(
-    `
-    DELETE FROM student_verification_codes
-    WHERE student_id = $1
-    AND verified = false
-    `,
-    [result.rows[0].id]
-);
+    const storedStudent =
+        localStorage.getItem(
+            "kuriosLoggedInStudent"
+        ) ||
+        sessionStorage.getItem(
+            "kuriosLoggedInStudent"
+        );
 
+    if (!storedStudent) {
+        return null;
+    }
 
-// ====================================
-// SAVE NEW OTP
-// ====================================
+    try {
 
-await pool.query(
-    `
-    INSERT INTO student_verification_codes
-    (
-        student_id,
-        otp,
-        expires_at
-    )
-    VALUES
-    ($1, $2, $3)
-    `,
-    [
-        result.rows[0].id,
-        otp,
-        expiresAt
-    ]
-);
+        return JSON.parse(storedStudent);
+
+    } catch (error) {
+
+        console.error(
+            "Unable to read logged-in student:",
+            error
+        );
+
+        return null;
+
+    }
+
+}
 
 
-// ====================================
-// SEND VERIFICATION EMAIL
-// ====================================
+// ========================================
+// SAVE AN UPDATED STUDENT OBJECT BACK TO
+// WHICHEVER STORAGE IT CAME FROM
+// ========================================
 
-await emailTransporter.sendMail({
+function saveLoggedInStudent(student) {
 
-    from: `"Kurios Stores" <${process.env.EMAIL_USER}>`,
+    const studentJson =
+        JSON.stringify(student);
 
-    to: result.rows[0].email,
+    if (
+        localStorage.getItem("kuriosLoggedInStudent")
+    ) {
 
-    subject: "Verify Your Kurios Stores Account",
+        localStorage.setItem(
+            "kuriosLoggedInStudent",
+            studentJson
+        );
 
-    html: `
-        <div style="
-            font-family: Arial, sans-serif;
-            max-width: 600px;
-            margin: 0 auto;
-            padding: 30px;
-            border: 1px solid #e5e7eb;
-            border-radius: 12px;
-        ">
+    } else {
 
-            <h2 style="color: #5b21b6;">
-                Welcome to Kurios Stores
-            </h2>
+        sessionStorage.setItem(
+            "kuriosLoggedInStudent",
+            studentJson
+        );
 
-            <p>
-                Hello <strong>${result.rows[0].first_name}</strong>,
-            </p>
+    }
 
-            <p>
-                Thank you for creating your Kurios Stores
-                student account.
-            </p>
+}
 
-            <p>
-                To activate your account, enter the
-                verification code below:
-            </p>
 
-            <div style="
-                margin: 25px 0;
-                padding: 20px;
-                text-align: center;
-                background: #f3f0ff;
-                border-radius: 10px;
-            ">
+// ========================================
+// MY PROFILE PANEL
+// ========================================
 
-                <span style="
-                    font-size: 32px;
-                    font-weight: bold;
-                    letter-spacing: 8px;
-                    color: #5b21b6;
-                ">
-                    ${otp}
+const accountProfile =
+    document.getElementById("accountProfile");
+
+const profileOverlay =
+    document.getElementById("profileOverlay");
+
+const profilePanel =
+    document.getElementById("profilePanel");
+
+const closeProfile =
+    document.getElementById("closeProfile");
+
+const editProfileButton =
+    document.getElementById("editProfileButton");
+
+const cancelProfileEdit =
+    document.getElementById("cancelProfileEdit");
+
+const saveProfileEdit =
+    document.getElementById("saveProfileEdit");
+
+const profilePhoneInput =
+    document.getElementById("profilePhoneInput");
+
+const profileDobInput =
+    document.getElementById("profileDobInput");
+
+const profilePictureInput =
+    document.getElementById("profilePictureInput");
+
+const profileAvatarCircle =
+    document.getElementById("profileAvatarCircle");
+
+const profileAvatarEditBadge =
+    document.getElementById("profileAvatarEditBadge");
+
+
+// Holds the file the student just picked,
+// until they hit Save.
+
+let selectedProfilePictureFile = null;
+
+
+// ========================================
+// SHOW A STUDENT'S DATA IN THE PANEL
+// (view mode fields)
+// ========================================
+
+function renderProfilePanel(student) {
+
+    // FULL NAME
+
+    const fullNameEl =
+        document.getElementById("profileFullName");
+
+    if (fullNameEl) {
+
+        const firstName =
+            student.first_name ||
+            student.firstName ||
+            "";
+
+        const lastName =
+            student.last_name ||
+            student.lastName ||
+            "";
+
+        const fullName =
+            `${firstName} ${lastName}`.trim();
+
+        fullNameEl.textContent =
+            fullName ||
+            "Student";
+
+    }
+
+
+    // STUDENT ID
+
+    const studentIdEl =
+        document.getElementById("profileStudentId");
+
+    if (studentIdEl) {
+
+        studentIdEl.textContent =
+            student.student_id ||
+            student.studentId ||
+            "Not provided";
+
+    }
+
+
+    // UNIVERSITY
+
+    const universityEl =
+        document.getElementById("profileUniversity");
+
+    if (universityEl) {
+
+        universityEl.textContent =
+            student.university ||
+            "Not provided";
+
+    }
+
+
+    // EMAIL
+
+    const emailEl =
+        document.getElementById("profileEmail");
+
+    if (emailEl) {
+
+        emailEl.textContent =
+            student.email ||
+            "Not provided";
+
+    }
+
+
+    // PHONE NUMBER
+
+    const phoneEl =
+        document.getElementById("profilePhone");
+
+    if (phoneEl) {
+
+        phoneEl.textContent =
+            student.phone ||
+            "Not provided";
+
+    }
+
+    if (profilePhoneInput) {
+
+        profilePhoneInput.value =
+            student.phone ||
+            "";
+
+    }
+
+
+    // DATE OF BIRTH
+
+    const dobEl =
+        document.getElementById("profileDob");
+
+    const dobRaw =
+        student.date_of_birth ||
+        student.dob ||
+        null;
+
+    // The database sends this back as a full
+    // timestamp — we only want the date part,
+    // both for display and for the date input.
+
+    const dobShort =
+        dobRaw ?
+            dobRaw.slice(0, 10) :
+            null;
+
+    if (dobEl) {
+
+        dobEl.textContent =
+            dobShort ||
+            "Not provided";
+
+    }
+
+    if (profileDobInput) {
+
+        profileDobInput.value =
+            dobShort ||
+            "";
+
+    }
+
+
+    // ACCOUNT STATUS
+
+    const statusEl =
+        document.getElementById("profileAccountStatus");
+
+    if (statusEl) {
+
+        statusEl.textContent =
+            student.email_verified === false ?
+                "Unverified" :
+                "Active";
+
+    }
+
+
+    // PROFILE PICTURE
+
+    renderProfileAvatar(
+        student.profile_picture
+    );
+
+}
+
+
+// ========================================
+// SHOW THE AVATAR — PICTURE IF THERE IS ONE,
+// OTHERWISE THE PLAIN PERSON ICON
+// ========================================
+
+function renderProfileAvatar(profilePicturePath) {
+
+    if (!profileAvatarCircle) {
+        return;
+    }
+
+
+    const existingImg =
+        profileAvatarCircle.querySelector("img");
+
+    if (existingImg) {
+        existingImg.remove();
+    }
+
+
+    if (profilePicturePath) {
+
+        const img =
+            document.createElement("img");
+
+        img.src =
+            API_URL + profilePicturePath;
+
+        img.alt =
+            "Profile picture";
+
+        profileAvatarCircle.insertBefore(
+            img,
+            profileAvatarCircle.firstChild
+        );
+
+    }
+
+}
+
+
+// ========================================
+// OPEN THE PANEL
+// ========================================
+
+function openProfilePanel() {
+
+    const student =
+        getLoggedInStudent();
+
+
+    // NOT LOGGED IN — SEND TO SIGN IN INSTEAD
+
+    if (!student) {
+
+        if (studentAccountMenu) {
+
+            studentAccountMenu.classList.remove(
+                "open"
+            );
+
+        }
+
+        openSignInModal();
+
+        return;
+
+    }
+
+
+    renderProfilePanel(student);
+    exitProfileEditMode();
+
+
+    if (studentAccountMenu) {
+
+        studentAccountMenu.classList.remove(
+            "open"
+        );
+
+    }
+
+    if (profileOverlay) {
+
+        profileOverlay.classList.add(
+            "open"
+        );
+
+    }
+
+}
+
+
+function closeProfilePanel() {
+
+    if (profileOverlay) {
+
+        profileOverlay.classList.remove(
+            "open"
+        );
+
+    }
+
+    exitProfileEditMode();
+
+}
+
+
+// ========================================
+// ENTER / EXIT EDIT MODE
+// ========================================
+
+function enterProfileEditMode() {
+
+    if (profilePanel) {
+
+        profilePanel.classList.add(
+            "editing"
+        );
+
+    }
+
+}
+
+
+function exitProfileEditMode() {
+
+    if (profilePanel) {
+
+        profilePanel.classList.remove(
+            "editing"
+        );
+
+    }
+
+
+    // Undo any unsaved picture preview and
+    // clear the picked file.
+
+    selectedProfilePictureFile = null;
+
+    if (profilePictureInput) {
+
+        profilePictureInput.value = "";
+
+    }
+
+    const student =
+        getLoggedInStudent();
+
+    if (student) {
+
+        renderProfileAvatar(
+            student.profile_picture
+        );
+
+    }
+
+}
+
+
+// ========================================
+// PICK A NEW PROFILE PICTURE
+// ========================================
+
+if (profileAvatarEditBadge) {
+
+    profileAvatarEditBadge.addEventListener(
+        "click",
+        function () {
+
+            if (profilePictureInput) {
+
+                profilePictureInput.click();
+
+            }
+
+        }
+    );
+
+}
+
+
+if (profilePictureInput) {
+
+    profilePictureInput.addEventListener(
+        "change",
+        function () {
+
+            const file =
+                profilePictureInput.files[0];
+
+            if (!file) {
+                return;
+            }
+
+
+            selectedProfilePictureFile =
+                file;
+
+
+            // Instant local preview before saving.
+
+            const reader =
+                new FileReader();
+
+            reader.onload = function () {
+
+                if (!profileAvatarCircle) {
+                    return;
+                }
+
+                const existingImg =
+                    profileAvatarCircle.querySelector("img");
+
+                if (existingImg) {
+                    existingImg.remove();
+                }
+
+                const img =
+                    document.createElement("img");
+
+                img.src =
+                    reader.result;
+
+                img.alt =
+                    "Profile picture preview";
+
+                profileAvatarCircle.insertBefore(
+                    img,
+                    profileAvatarCircle.firstChild
+                );
+
+            };
+
+            reader.readAsDataURL(file);
+
+        }
+    );
+
+}
+
+
+// ========================================
+// SAVE PROFILE CHANGES
+// ========================================
+
+if (saveProfileEdit) {
+
+    saveProfileEdit.addEventListener(
+        "click",
+        async function () {
+
+            const student =
+                getLoggedInStudent();
+
+            if (!student) {
+                return;
+            }
+
+
+            const formData =
+                new FormData();
+
+            formData.append(
+                "studentId",
+                student.id
+            );
+
+            if (profilePhoneInput) {
+
+                formData.append(
+                    "phone",
+                    profilePhoneInput.value.trim()
+                );
+
+            }
+
+            if (profileDobInput && profileDobInput.value) {
+
+                formData.append(
+                    "dateOfBirth",
+                    profileDobInput.value
+                );
+
+            }
+
+            if (selectedProfilePictureFile) {
+
+                formData.append(
+                    "profilePicture",
+                    selectedProfilePictureFile
+                );
+
+            }
+
+
+            saveProfileEdit.disabled = true;
+
+            saveProfileEdit.textContent =
+                "Saving...";
+
+
+            try {
+
+                const response =
+                    await fetch(
+                        API_URL + "/api/students/update-profile",
+                        {
+                            method: "POST",
+                            body: formData
+                        }
+                    );
+
+                const data =
+                    await response.json();
+
+
+                if (!data.success) {
+
+                    showMessage(
+                        data.message ||
+                        "Could not update your profile."
+                    );
+
+                    return;
+
+                }
+
+
+                // Merge the returned fields into the
+                // stored student so nothing already
+                // held (like the password-free login
+                // fields) gets lost.
+
+                const updatedStudent =
+                    Object.assign(
+                        {},
+                        student,
+                        data.student
+                    );
+
+                saveLoggedInStudent(
+                    updatedStudent
+                );
+
+                renderProfilePanel(
+                    updatedStudent
+                );
+
+                exitProfileEditMode();
+
+                showMessage(
+                    "Profile updated successfully."
+                );
+
+            } catch (error) {
+
+                console.error(
+                    "Profile update error:",
+                    error
+                );
+
+                showMessage(
+                    "Could not reach the server. Please try again."
+                );
+
+            } finally {
+
+                saveProfileEdit.disabled = false;
+
+                saveProfileEdit.textContent =
+                    "Save Changes";
+
+            }
+
+        }
+    );
+
+}
+
+
+if (editProfileButton) {
+
+    editProfileButton.addEventListener(
+        "click",
+        enterProfileEditMode
+    );
+
+}
+
+
+if (cancelProfileEdit) {
+
+    cancelProfileEdit.addEventListener(
+        "click",
+        function () {
+
+            const student =
+                getLoggedInStudent();
+
+            if (student) {
+
+                renderProfilePanel(
+                    student
+                );
+
+            }
+
+            exitProfileEditMode();
+
+        }
+    );
+
+}
+
+
+if (accountProfile) {
+
+    accountProfile.addEventListener(
+        "click",
+        openProfilePanel
+    );
+
+}
+
+
+if (closeProfile) {
+
+    closeProfile.addEventListener(
+        "click",
+        closeProfilePanel
+    );
+
+}
+
+
+// Clicking outside the profile panel closes it.
+
+if (profileOverlay) {
+
+    profileOverlay.addEventListener(
+        "click",
+        function (event) {
+
+            if (
+                event.target === profileOverlay
+            ) {
+
+                closeProfilePanel();
+
+            }
+
+        }
+    );
+
+}
+
+
+// ========================================
+// MY ORDERS PANEL
+// ========================================
+
+const accountOrders =
+    document.getElementById("accountOrders");
+
+const dashboardMyOrders =
+    document.getElementById("dashboardMyOrders");
+
+const ordersOverlay =
+    document.getElementById("ordersOverlay");
+
+const closeOrders =
+    document.getElementById("closeOrders");
+
+const ordersPanelBody =
+    document.getElementById("ordersPanelBody");
+
+
+const ORDERS_EMPTY_STATE_HTML = `
+    <div class="empty-cart">
+        <i class="fa-solid fa-box"></i>
+        <h3>No orders yet</h3>
+        <p>Your past orders will show up here once you check out.</p>
+    </div>
+`;
+
+
+function formatOrderDate(dateString) {
+
+    const date =
+        new Date(dateString);
+
+    if (isNaN(date.getTime())) {
+        return "";
+    }
+
+    return date.toLocaleDateString(
+        "en-NG",
+        {
+            day: "numeric",
+            month: "short",
+            year: "numeric"
+        }
+    );
+
+}
+
+
+function renderOrderCard(order) {
+
+    const statusClass =
+        "status-" + order.status;
+
+    const statusLabel =
+        order.status.charAt(0).toUpperCase() +
+        order.status.slice(1);
+
+    const itemRows =
+        order.items.map(function (item) {
+
+            return `
+                <div class="order-card-item-row">
+                    <span>${item.name} × ${item.quantity}</span>
+                    <span>${formatMoney(item.price * item.quantity)}</span>
+                </div>
+            `;
+
+        }).join("");
+
+    return `
+        <div class="order-card">
+
+            <div class="order-card-top">
+
+                <div>
+                    <div class="order-card-reference">
+                        ${order.payment_reference}
+                    </div>
+                    <div class="order-card-date">
+                        ${formatOrderDate(order.created_at)}
+                    </div>
+                </div>
+
+                <span class="order-status-badge ${statusClass}">
+                    ${statusLabel}
                 </span>
 
             </div>
 
-            <p>
-                This verification code will expire in
-                <strong>10 minutes</strong>.
-            </p>
+            <div class="order-card-items">
+                ${itemRows}
+            </div>
 
-            <p>
-                If you did not create this account,
-                please ignore this email.
-            </p>
-
-            <br>
-
-            <p>
-                Regards,<br>
-                <strong>Kurios Stores</strong>
-            </p>
+            <div class="order-card-total">
+                <span>Total</span>
+                <strong>${formatMoney(order.amount)}</strong>
+            </div>
 
         </div>
-    `
+    `;
 
-});
+}
 
 
-// ====================================
-// REGISTRATION SUCCESS
-// ====================================
+async function loadOrdersIntoPanel(studentId) {
 
-res.status(201).json({
-
-    success: true,
-
-    message:
-        "Account created successfully. Please check your email for the verification code.",
-
-    requiresVerification: true,
-
-    studentId: result.rows[0].id,
-
-    email: result.rows[0].email
-
-});
-
-    } catch (error) {
-
-        console.error(
-            "Registration error:",
-            error.message
-        );
-
-        res.status(500).json({
-
-            success: false,
-
-            message:
-                "Something went wrong while creating the account."
-
-        });
-
+    if (!ordersPanelBody) {
+        return;
     }
 
-});
-
-// ========================================
-// VERIFY STUDENT EMAIL OTP
-// ========================================
-
-app.post("/api/students/verify-otp", async (req, res) => {
+    ordersPanelBody.innerHTML = `
+        <div class="empty-cart">
+            <i class="fa-solid fa-spinner"></i>
+            <h3>Loading your orders...</h3>
+        </div>
+    `;
 
     try {
 
-        const {
-            studentId,
-            otp
-        } = req.body;
-
-
-        // ====================================
-        // VALIDATE INPUT
-        // ====================================
-
-        if (!studentId || !otp) {
-
-            return res.status(400).json({
-                success: false,
-                message: "Student ID and verification code are required."
-            });
-
-        }
-
-
-        // ====================================
-        // FIND OTP
-        // ====================================
-
-        const otpResult = await pool.query(
-            `
-            SELECT
-                id,
-                student_id,
-                otp,
-                expires_at,
-                verified
-            FROM student_verification_codes
-            WHERE student_id = $1
-            AND otp = $2
-            AND verified = false
-            ORDER BY created_at DESC
-            LIMIT 1
-            `,
-            [
-                studentId,
-                otp.toString().trim()
-            ]
-        );
-
-
-        // ====================================
-        // INVALID OTP
-        // ====================================
-
-        if (otpResult.rows.length === 0) {
-
-            return res.status(400).json({
-                success: false,
-                message: "Invalid verification code."
-            });
-
-        }
-
-
-        const verificationCode = otpResult.rows[0];
-
-
-        // ====================================
-        // CHECK EXPIRATION
-        // ====================================
-
-        if (
-            new Date(verificationCode.expires_at) < new Date()
-        ) {
-
-            return res.status(400).json({
-                success: false,
-                message: "This verification code has expired. Please request a new code."
-            });
-
-        }
-
-
-        // ====================================
-        // MARK OTP AS VERIFIED
-        // ====================================
-
-        await pool.query(
-            `
-            UPDATE student_verification_codes
-            SET verified = true
-            WHERE id = $1
-            `,
-            [verificationCode.id]
-        );
-
-
-        // ====================================
-        // VERIFY STUDENT EMAIL
-        // ====================================
-
-        const studentResult = await pool.query(
-            `
-            UPDATE students
-            SET email_verified = true,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $1
-            RETURNING
-                id,
-                first_name,
-                last_name,
-                email,
-                phone,
-                whatsapp_number,
-                university,
-                student_id,
-                date_of_birth,
-                profile_picture,
-                email_verified
-            `,
-            [studentId]
-        );
-
-
-        // ====================================
-        // SUCCESS
-        // ====================================
-
-        if (studentResult.rows.length === 0) {
-
-            return res.status(404).json({
-                success: false,
-                message: "Student account could not be found."
-            });
-
-        }
-
-
-        res.status(200).json({
-
-            success: true,
-
-            message:
-                "Email verified successfully. Your Kurios Stores account is now active.",
-
-            student: studentResult.rows[0]
-
-        });
-
-    } catch (error) {
-
-        console.error(
-            "OTP verification error:",
-            error.message
-        );
-
-        res.status(500).json({
-
-            success: false,
-
-            message:
-                "Something went wrong while verifying your account."
-
-        });
-
-    }
-
-});
-
-
-// ========================================
-// RESEND STUDENT EMAIL OTP
-// ========================================
-
-app.post("/api/students/resend-otp", async (req, res) => {
-
-    try {
-
-        const {
-            studentId,
-            email
-        } = req.body;
-
-
-        // ====================================
-        // VALIDATE INPUT
-        // ====================================
-
-        if (!studentId || !email) {
-
-            return res.status(400).json({
-
-                success: false,
-
-                message:
-                    "Student ID and email are required."
-
-            });
-
-        }
-
-
-        // ====================================
-        // FIND STUDENT
-        // ====================================
-
-        const studentResult = await pool.query(
-            `
-            SELECT
-                id,
-                first_name,
-                email,
-                email_verified
-            FROM students
-            WHERE id = $1
-            AND LOWER(email) = LOWER($2)
-            LIMIT 1
-            `,
-            [
-                studentId,
-                email.trim()
-            ]
-        );
-
-
-        // ====================================
-        // STUDENT NOT FOUND
-        // ====================================
-
-        if (studentResult.rows.length === 0) {
-
-            return res.status(404).json({
-
-                success: false,
-
-                message:
-                    "Student account could not be found."
-
-            });
-
-        }
-
-
-        const student =
-            studentResult.rows[0];
-
-            console.log("LOGIN USER FOUND:", student.email);
-
-
-        // ====================================
-        // CHECK IF ALREADY VERIFIED
-        // ====================================
-
-        if (student.email_verified) {
-
-            return res.status(400).json({
-
-                success: false,
-
-                message:
-                    "This student account has already been verified."
-
-            });
-
-        }
-
-
-        // ====================================
-        // GENERATE NEW OTP
-        // ====================================
-
-        const otp =
-            crypto
-                .randomInt(
-                    100000,
-                    1000000
-                )
-                .toString();
-
-
-        // ====================================
-        // OTP EXPIRATION
-        // ====================================
-
-        const expiresAt =
-            new Date(
-                Date.now() +
-                10 * 60 * 1000
+        const response =
+            await fetch(
+                API_URL + "/api/orders?studentId=" + studentId
             );
 
+        const data =
+            await response.json();
 
-        // ====================================
-        // REMOVE OLD OTP
-        // ====================================
+        if (!data.success) {
 
-        await pool.query(
-            `
-            DELETE FROM student_verification_codes
-            WHERE student_id = $1
-            AND verified = false
-            `,
-            [
-                student.id
-            ]
-        );
-
-
-        // ====================================
-        // SAVE NEW OTP
-        // ====================================
-
-        await pool.query(
-            `
-            INSERT INTO student_verification_codes
-            (
-                student_id,
-                otp,
-                expires_at
-            )
-            VALUES
-            ($1, $2, $3)
-            `,
-            [
-                student.id,
-                otp,
-                expiresAt
-            ]
-        );
-
-
-        // ====================================
-        // SEND NEW OTP EMAIL
-        // ====================================
-
-        await emailTransporter.sendMail({
-
-            from:
-                `"Kurios Stores" <${process.env.EMAIL_USER}>`,
-
-            to:
-                student.email,
-
-            subject:
-                "Your New Kurios Stores Verification Code",
-
-            html: `
-                <div style="
-                    font-family: Arial, sans-serif;
-                    max-width: 600px;
-                    margin: 0 auto;
-                    padding: 30px;
-                    border: 1px solid #e5e7eb;
-                    border-radius: 12px;
-                ">
-
-                    <h2 style="color: #5b21b6;">
-                        Kurios Stores
-                    </h2>
-
-                    <p>
-                        Hello
-                        <strong>${student.first_name}</strong>,
-                    </p>
-
-                    <p>
-                        Here is your new email
-                        verification code:
-                    </p>
-
-                    <div style="
-                        margin: 25px 0;
-                        padding: 20px;
-                        text-align: center;
-                        background: #f3f0ff;
-                        border-radius: 10px;
-                    ">
-
-                        <span style="
-                            font-size: 32px;
-                            font-weight: bold;
-                            letter-spacing: 8px;
-                            color: #5b21b6;
-                        ">
-                            ${otp}
-                        </span>
-
-                    </div>
-
-                    <p>
-                        This verification code will expire
-                        in <strong>10 minutes</strong>.
-                    </p>
-
-                    <p>
-                        If you did not request a new code,
-                        please ignore this email.
-                    </p>
-
-                    <br>
-
-                    <p>
-                        Regards,<br>
-                        <strong>Kurios Stores</strong>
-                    </p>
-
+            ordersPanelBody.innerHTML = `
+                <div class="empty-cart">
+                    <i class="fa-solid fa-triangle-exclamation"></i>
+                    <h3>Could not load your orders</h3>
+                    <p>${data.message || "Please try again."}</p>
                 </div>
-            `
+            `;
 
-        });
+            return;
 
+        }
 
-        // ====================================
-        // RESEND SUCCESS
-        // ====================================
+        if (data.orders.length === 0) {
 
-        res.status(200).json({
+            ordersPanelBody.innerHTML =
+                ORDERS_EMPTY_STATE_HTML;
 
-            success: true,
+            return;
 
-            message:
-                "A new verification code has been sent to your email."
+        }
 
-        });
-
+        ordersPanelBody.innerHTML =
+            data.orders.map(renderOrderCard).join("");
 
     } catch (error) {
 
         console.error(
-            "Resend OTP error:",
-            error.message
+            "Load orders error:",
+            error
         );
 
-
-        res.status(500).json({
-
-            success: false,
-
-            message:
-                "Something went wrong while sending a new verification code."
-
-        });
+        ordersPanelBody.innerHTML = `
+            <div class="empty-cart">
+                <i class="fa-solid fa-triangle-exclamation"></i>
+                <h3>Could not reach the server</h3>
+                <p>Please try again.</p>
+            </div>
+        `;
 
     }
 
-});
+}
+
+
+function openOrdersPanel() {
+
+    const student =
+        getLoggedInStudent();
+
+    if (!student) {
+
+        if (studentAccountMenu) {
+
+            studentAccountMenu.classList.remove(
+                "open"
+            );
+
+        }
+
+        openSignInModal();
+
+        return;
+
+    }
+
+    if (studentAccountMenu) {
+
+        studentAccountMenu.classList.remove(
+            "open"
+        );
+
+    }
+
+    if (ordersOverlay) {
+
+        ordersOverlay.classList.add(
+            "open"
+        );
+
+    }
+
+    loadOrdersIntoPanel(
+        student.id
+    );
+
+}
+
+
+function closeOrdersPanel() {
+
+    if (ordersOverlay) {
+
+        ordersOverlay.classList.remove(
+            "open"
+        );
+
+    }
+
+}
 
 
 // ========================================
-// STUDENT LOGIN
+// KEEP THE HERO'S ORDER COUNT ACCURATE
+// ("active" = paid, not yet fulfilled)
 // ========================================
 
-app.post("/api/students/login", async (req, res) => {
+async function refreshOrderCountBadge(studentId) {
+
+    const heroActiveOrdersEl =
+        document.getElementById("heroActiveOrders");
+
+    const heroOrdersBadgeEl =
+        document.getElementById("heroOrdersBadge");
+
+    if (!heroActiveOrdersEl || !heroOrdersBadgeEl) {
+        return;
+    }
 
     try {
 
-        const {
-            email,
-            password
-        } = req.body;
-
-
-        // ========================================
-        // VALIDATE INPUT
-        // ========================================
-
-        if (!email || !password) {
-
-            return res.status(400).json({
-                success: false,
-                message: "Email and password are required."
-            });
-
-        }
-
-
-        // ========================================
-        // FIND STUDENT
-        // ========================================
-
-        const studentResult = await pool.query(
-            `
-            SELECT
-                id,
-                first_name,
-                last_name,
-                email,
-                phone,
-                whatsapp_number,
-                university,
-                student_id,
-                date_of_birth,
-                profile_picture,
-                password_hash,
-                email_verified
-            FROM students
-            WHERE LOWER(email) = LOWER($1)
-            LIMIT 1
-            `,
-            [
-                email.trim()
-            ]
-        );
-
-
-        // ========================================
-        // ACCOUNT NOT FOUND
-        // ========================================
-
-        if (studentResult.rows.length === 0) {
-
-            return res.status(401).json({
-                success: false,
-                message: "Invalid email or password."
-            });
-
-        }
-
-
-        const student =
-            studentResult.rows[0];
-
-
-        // ========================================
-        // CHECK EMAIL VERIFICATION
-        // ========================================
-
-        if (!student.email_verified) {
-
-            return res.status(403).json({
-                success: false,
-                message:
-                    "Your email has not been verified. Please complete email verification before signing in.",
-                requiresVerification: true,
-                studentId: student.id,
-                email: student.email
-            });
-
-        }
-
-
-        // ========================================
-        // CHECK PASSWORD
-        // ========================================
-
-        const passwordMatches =
-            await bcrypt.compare(
-                password,
-                student.password_hash
+        const response =
+            await fetch(
+                API_URL + "/api/orders?studentId=" + studentId
             );
 
-            console.log("PASSWORD MATCH:", passwordMatches);
+        const data =
+            await response.json();
 
-
-        if (!passwordMatches) {
-
-            return res.status(401).json({
-                success: false,
-                message: "Invalid email or password."
-            });
-
+        if (!data.success) {
+            return;
         }
 
+        const activeOrderCount =
+            data.orders.filter(function (order) {
 
-        // ========================================
-        // SUCCESSFUL LOGIN
-        // ========================================
+                return order.status === "paid";
 
-        const {
-            password_hash,
-            ...safeStudent
-        } = student;
+            }).length;
 
+        heroActiveOrdersEl.textContent =
+            `${activeOrderCount} active order${activeOrderCount === 1 ? "" : "s"}`;
 
-        return res.status(200).json({
-
-            success: true,
-
-            message:
-                "Login successful. Welcome back to Kurios Stores.",
-
-            student: safeStudent
-
-        });
-
+        heroOrdersBadgeEl.textContent =
+            activeOrderCount;
 
     } catch (error) {
 
         console.error(
-            "Student login error:",
-            error.message
+            "Order count refresh error:",
+            error
         );
-
-
-        return res.status(500).json({
-
-            success: false,
-
-            message:
-                "Something went wrong while signing you in."
-
-        });
 
     }
 
-});
+}
 
 
-// ========================================
-// UPDATE STUDENT PROFILE
-// (phone, date of birth, profile picture)
-// ========================================
+if (accountOrders) {
 
-app.post(
-    "/api/students/update-profile",
-    function (req, res, next) {
+    accountOrders.addEventListener(
+        "click",
+        openOrdersPanel
+    );
 
-        // Run multer, but turn its errors into
-        // the same JSON error shape as everywhere else.
+}
 
-        profilePictureUpload.single("profilePicture")(
-            req,
-            res,
-            function (error) {
 
-                if (error) {
+if (dashboardMyOrders) {
 
-                    return res.status(400).json({
-                        success: false,
-                        message: error.message
-                    });
+    dashboardMyOrders.addEventListener(
+        "click",
+        openOrdersPanel
+    );
+
+}
+
+
+if (closeOrders) {
+
+    closeOrders.addEventListener(
+        "click",
+        closeOrdersPanel
+    );
+
+}
+
+
+if (ordersOverlay) {
+
+    ordersOverlay.addEventListener(
+        "click",
+        function (event) {
+
+            if (
+                event.target === ordersOverlay
+            ) {
+
+                closeOrdersPanel();
+
+            }
+
+        }
+    );
+
+}
+
+
+
+
+    if (closeSignIn) {
+
+        closeSignIn.addEventListener(
+            "click",
+            closeSignInModal
+        );
+
+    }
+
+
+
+    if (signInModal) {
+
+        signInModal.addEventListener(
+            "click",
+            function (event) {
+
+                if (
+                    event.target ===
+                    signInModal
+                ) {
+
+                    closeSignInModal();
 
                 }
 
-                next();
+            }
+        );
+
+    }
+
+
+
+    /*
+        Current sign-in is still
+        a frontend demonstration.
+
+        REAL authentication will be
+        connected to PostgreSQL later.
+    */
+
+    // ========================================
+// STUDENT SIGN IN
+// ========================================
+
+if (signInForm) {
+
+    signInForm.addEventListener(
+        "submit",
+        async function (event) {
+
+            event.preventDefault();
+
+
+            // ========================================
+            // GET FORM VALUES
+            // ========================================
+
+            const email =
+                document.getElementById(
+                    "signinEmail"
+                ).value.trim();
+
+            const password =
+                document.getElementById(
+                    "signinPassword"
+                ).value;
+
+
+            // ========================================
+            // VALIDATE INPUT
+            // ========================================
+
+            if (
+                email === "" ||
+                password === ""
+            ) {
+
+                showMessage(
+                    "Please fill in all fields."
+                );
+
+                return;
+
+            }
+
+
+            // ========================================
+            // GET SIGN IN BUTTON
+            // ========================================
+
+            const signInButton =
+                signInForm.querySelector(
+                    'button[type="submit"]'
+                );
+
+
+            // ========================================
+            // DISABLE BUTTON
+            // ========================================
+
+            if (signInButton) {
+
+                signInButton.disabled = true;
+
+                signInButton.innerHTML = `
+                    <i class="fa-solid fa-spinner fa-spin"></i>
+                    Signing In...
+                `;
+
+            }
+
+
+            try {
+
+                // ========================================
+                // SEND LOGIN REQUEST
+                // ========================================
+
+                const response =
+                    await fetch(
+                        API_URL + "/api/students/login",
+                        {
+
+                            method: "POST",
+
+                            headers: {
+                                "Content-Type":
+                                    "application/json"
+                            },
+
+                            body: JSON.stringify({
+
+                                email:
+                                    email,
+
+                                password:
+                                    password
+
+                            })
+
+                        }
+                    );
+
+
+                // ========================================
+                // READ RESPONSE
+                // ========================================
+
+                const data =
+                    await response.json();
+
+
+                // ========================================
+                // LOGIN FAILED
+                // ========================================
+
+                if (
+                    !response.ok ||
+                    !data.success
+                ) {
+
+                    showMessage(
+                        data.message ||
+                        "Invalid email or password."
+                    );
+
+                    return;
+
+                }
+
+
+                // ========================================
+                // LOGIN SUCCESSFUL
+                // ========================================
+
+                console.log(
+                    "Student logged in successfully:",
+                    data.student
+                );
+
+
+                // ========================================
+                // SAVE LOGGED-IN STUDENT
+                // ========================================
+
+                const rememberMe =
+                    document.getElementById(
+                        "rememberMe"
+                    );
+
+
+                if (
+                    rememberMe &&
+                    rememberMe.checked
+                ) {
+
+                    localStorage.setItem(
+                        "kuriosLoggedInStudent",
+                        JSON.stringify(
+                            data.student
+                        )
+                    );
+
+                } else {
+
+                    sessionStorage.setItem(
+                        "kuriosLoggedInStudent",
+                        JSON.stringify(
+                            data.student
+                        )
+                    );
+
+                }
+
+
+                // ========================================
+                // SUCCESS MESSAGE
+                // ========================================
+
+                showMessage(
+                    "Login successful. Welcome back to Kurios Stores."
+                );
+
+updateLoginState();
+
+
+
+
+
+                // ========================================
+                // CLOSE SIGN-IN MODAL
+                // ========================================
+
+                const signInModal =
+                    document.getElementById(
+                        "signInModal"
+                    );
+
+                if (signInModal) {
+
+                    signInModal.classList.remove(
+                        "open"
+                    );
+
+                }
+
+
+                // ========================================
+                // CLEAR PASSWORD
+                // ========================================
+
+                const passwordInput =
+                    document.getElementById(
+                        "signinPassword"
+                    );
+
+                if (passwordInput) {
+
+                    passwordInput.value = "";
+
+                }
+
+
+                // ========================================
+                // UPDATE UI
+                // ========================================
+
+                console.log(
+                    "Logged-in student:",
+                    data.student
+                );
+
+
+            } catch (error) {
+
+                console.error(
+                    "Sign-in error:",
+                    error
+                );
+
+
+                showMessage(
+                    "Unable to connect to Kurios Stores server."
+                );
+
+
+            } finally {
+
+                // ========================================
+                // RESTORE BUTTON
+                // ========================================
+
+                if (signInButton) {
+
+                    signInButton.disabled = false;
+
+                    signInButton.innerHTML = `
+                        Sign In
+                    `;
+
+                }
+
+            }
+
+        }
+    );
+
+}
+
+
+
+    /* =====================================================
+       13. SIGN UP MODAL
+       ===================================================== */
+
+
+    const signUpModal =
+        document.getElementById(
+            "signUpModal"
+        );
+
+
+    const openSignUp =
+        document.getElementById(
+            "openSignUp"
+        );
+
+
+    const closeSignUp =
+        document.getElementById(
+            "closeSignUp"
+        );
+
+
+    const signupForm =
+        document.getElementById(
+            "signupForm"
+        );
+
+
+    const backToSignIn =
+        document.getElementById(
+            "backToSignIn"
+        );
+
+
+
+    function openSignUpModal() {
+
+        if (signInModal) {
+
+            signInModal.classList.remove(
+                "active"
+            );
+
+        }
+
+
+        if (signUpModal) {
+
+            signUpModal.classList.add(
+                "active"
+            );
+
+        }
+
+    }
+
+
+
+    function closeSignUpModal() {
+
+        if (signUpModal) {
+
+            signUpModal.classList.remove(
+                "active"
+            );
+
+        }
+
+    }
+
+
+
+    if (openSignUp) {
+
+        openSignUp.addEventListener(
+            "click",
+            function (event) {
+
+                event.preventDefault();
+
+                openSignUpModal();
 
             }
         );
 
-    },
-    async (req, res) => {
+    }
+
+
+
+    if (closeSignUp) {
+
+        closeSignUp.addEventListener(
+            "click",
+            closeSignUpModal
+        );
+
+    }
+
+
+
+    if (backToSignIn) {
+
+        backToSignIn.addEventListener(
+            "click",
+            function (event) {
+
+                event.preventDefault();
+
+                closeSignUpModal();
+
+                openSignInModal();
+
+            }
+        );
+
+    }
+
+
+
+    if (signupForm) {
+
+    signupForm.addEventListener(
+        "submit",
+        async function (event) {
+
+            event.preventDefault();
+
+            // ========================================
+            // GET FORM VALUES
+            // ========================================
+
+            const firstName =
+                document.getElementById("signupFirstName").value.trim();
+
+            const lastName =
+                document.getElementById("signupLastName").value.trim();
+
+            const email =
+                document.getElementById("signupEmail").value.trim();
+
+            const phone =
+                document.getElementById("signupPhone").value.trim();
+
+            const whatsappNumber =
+                document.getElementById("signupWhatsapp").value.trim();
+
+            const university =
+                document.getElementById("signupUniversity").value.trim();
+
+            const studentId =
+                document.getElementById("signupStudentId").value.trim();
+
+            const password =
+                document.getElementById("signupPassword").value;
+
+            const confirmPassword =
+                document.getElementById("signupConfirmPassword").value;
+
+            const agreedStudent =
+                document.getElementById("agreedStudent").checked;
+
+            const agreedTerms =
+                document.getElementById("agreedTerms").checked;
+
+            const agreedPrivacy =
+                document.getElementById("agreedPrivacy").checked;
+
+            const receiveNotifications =
+                document.getElementById("receiveNotifications").checked;
+
+
+            // ========================================
+            // FRONTEND VALIDATION
+            // ========================================
+
+            if (
+                !firstName ||
+                !lastName ||
+                !email ||
+                !phone ||
+                !university ||
+                !studentId ||
+                !password ||
+                !confirmPassword
+            ) {
+
+                showMessage(
+                    "Please fill in all required fields."
+                );
+
+                return;
+            }
+
+
+            // ========================================
+            // PASSWORD CHECK
+            // ========================================
+
+            if (password !== confirmPassword) {
+
+                showMessage(
+                    "Passwords do not match."
+                );
+
+                return;
+            }
+
+
+            if (password.length < 6) {
+
+                showMessage(
+                    "Password must be at least 6 characters."
+                );
+
+                return;
+            }
+
+
+            // ========================================
+            // STUDENT CONFIRMATION
+            // ========================================
+
+            if (!agreedStudent) {
+
+                showMessage(
+                    "Please confirm that you are a student."
+                );
+
+                return;
+            }
+
+
+            // ========================================
+            // TERMS & PRIVACY
+            // ========================================
+
+            if (!agreedTerms || !agreedPrivacy) {
+
+                showMessage(
+                    "Please agree to the Terms and Privacy Policy."
+                );
+
+                return;
+            }
+
+
+            // ========================================
+            // DISABLE BUTTON WHILE REGISTERING
+            // ========================================
+
+            const submitButton =
+                document.getElementById("signupSubmit");
+
+            if (submitButton) {
+
+                submitButton.disabled = true;
+
+                submitButton.textContent =
+                    "Creating Account...";
+            }
+
+
+            // ========================================
+            // SEND DATA TO BACKEND
+            // ========================================
+
+            try {
+
+                const response = await fetch(
+                    API_URL + "/api/students/register",
+                    {
+
+                        method: "POST",
+
+                        headers: {
+                            "Content-Type": "application/json"
+                        },
+
+                        body: JSON.stringify({
+
+                            firstName: firstName,
+
+                            lastName: lastName,
+
+                            email: email,
+
+                            phone: phone,
+
+                            whatsappNumber:
+                                whatsappNumber || null,
+
+                            university: university,
+
+                            studentId: studentId,
+
+                            password: password,
+
+                            confirmPassword:
+                                confirmPassword,
+
+                            agreedStudent:
+                                agreedStudent,
+
+                            agreedTerms:
+                                agreedTerms,
+
+                            agreedPrivacy:
+                                agreedPrivacy,
+
+                            receiveNotifications:
+                                receiveNotifications
+
+                        })
+
+                    }
+                );
+
+
+                // ========================================
+// READ BACKEND RESPONSE
+// ========================================
+
+const data =
+    await response.json();
+
+
+// ========================================
+// CONTINUE UNVERIFIED REGISTRATION
+// ========================================
+
+if (
+    response.ok &&
+    data.success &&
+    data.requiresVerification &&
+    data.continueRegistration
+) {
+
+    console.log(
+        "Continuing unverified registration:",
+        data.student
+    );
+
+
+    showOtpVerificationScreen(
+        data.studentId,
+        data.email
+    );
+
+
+    return;
+
+}
+
+
+// ========================================
+// INVALID OTP
+// ========================================
+
+if (!response.ok || !data.success) {
+
+    showMessage(
+        data.message ||
+        "Something went wrong while creating the account."
+    );
+
+    return;
+}
+
+
+// ========================================
+// SUCCESS - OTP VERIFICATION
+// ========================================
+
+console.log(
+    "Registration successful:",
+    data
+);
+
+
+// ========================================
+// CONFIRM VERIFICATION DATA
+// ========================================
+
+if (
+    !data.studentId ||
+    !data.email
+) {
+
+    console.error(
+        "Missing verification data:",
+        data
+    );
+
+    showMessage(
+        "Account was created, but verification information is missing."
+    );
+
+    return;
+}
+
+
+// ========================================
+// CLEAR REGISTRATION FORM
+// ========================================
+
+signupForm.reset();
+
+
+// ========================================
+// SHOW OTP VERIFICATION SCREEN
+// ========================================
+
+showOtpVerificationScreen(
+    data.studentId,
+    data.email
+);
+
+
+            } catch (error) {
+
+                console.error(
+                    "Registration error:",
+                    error
+                );
+
+                showMessage(
+                    "Unable to connect to Kurios Stores server."
+                );
+
+            } finally {
+
+                // ========================================
+                // ENABLE BUTTON AGAIN
+                // ========================================
+
+                if (submitButton) {
+
+                    submitButton.disabled = false;
+
+                    submitButton.textContent =
+                        "Create Student Account";
+
+                }
+
+            }
+
+        }
+    );
+
+}
+
+
+    /* =====================================================
+       14. NOTIFICATIONS
+       ===================================================== */
+
+
+    const notificationButton =
+        document.getElementById(
+            "notificationButton"
+        );
+
+
+    const notificationPanel =
+        document.getElementById(
+            "notificationPanel"
+        );
+
+
+    const closeNotifications =
+        document.getElementById(
+            "closeNotifications"
+        );
+
+
+    const notificationList =
+        document.getElementById(
+            "notificationList"
+        );
+
+
+    const notificationBadge =
+        document.getElementById(
+            "notificationBadge"
+        );
+
+
+
+    /*
+        Temporary local notifications.
+
+        Later these will come from PostgreSQL.
+    */
+
+    let notifications =
+        JSON.parse(
+            localStorage.getItem(
+                "kuriosNotifications"
+            )
+        ) || [];
+
+
+
+    function saveNotifications() {
+
+        localStorage.setItem(
+            "kuriosNotifications",
+            JSON.stringify(
+                notifications
+            )
+        );
+
+    }
+
+
+
+    function renderNotifications() {
+
+
+        if (!notificationList) {
+            return;
+        }
+
+
+
+        notificationList.innerHTML = "";
+
+
+
+        if (
+            notifications.length === 0
+        ) {
+
+            notificationList.innerHTML = `
+
+                <div class="empty-state">
+
+                    <i class="fa-regular fa-bell-slash"></i>
+
+                    <h4>
+                        No notifications
+                    </h4>
+
+                    <p>
+                        You're all caught up.
+                    </p>
+
+                </div>
+
+            `;
+
+        }
+
+
+
+        notifications.forEach(
+            function (notification) {
+
+
+                const item =
+                    document.createElement(
+                        "div"
+                    );
+
+
+                item.className =
+                    "notification-item";
+
+
+                item.innerHTML = `
+
+                    <div class="notification-icon">
+
+                        <i class="fa-solid fa-bell"></i>
+
+                    </div>
+
+                    <div>
+
+                        <strong>
+
+                            ${notification.title}
+
+                        </strong>
+
+                        <p>
+
+                            ${notification.message}
+
+                        </p>
+
+                    </div>
+
+                `;
+
+
+                notificationList.appendChild(
+                    item
+                );
+
+            }
+        );
+
+
+
+        /*
+            Update notification badge.
+        */
+
+        if (notificationBadge) {
+
+            notificationBadge.textContent =
+                notifications.length;
+
+        }
+
+    }
+
+
+
+    if (notificationButton) {
+
+        notificationButton.addEventListener(
+            "click",
+            function () {
+
+                if (notificationPanel) {
+
+                    notificationPanel.classList.toggle(
+                        "active"
+                    );
+
+                }
+
+            }
+        );
+
+    }
+
+
+
+    if (closeNotifications) {
+
+        closeNotifications.addEventListener(
+            "click",
+            function () {
+
+                if (notificationPanel) {
+
+                    notificationPanel.classList.remove(
+                        "active"
+                    );
+
+                }
+
+            }
+        );
+
+    }
+
+
+
+    /* =====================================================
+       15. CHAT SYSTEM — FRONTEND DEMO
+       ===================================================== */
+
+
+    const chatContacts =
+        document.querySelectorAll(
+            ".chat-contact"
+        );
+
+
+    const activeChatName =
+        document.getElementById(
+            "activeChatName"
+        );
+
+
+    const activeChatStatus =
+        document.getElementById(
+            "activeChatStatus"
+        );
+
+
+    const activeChatAvatar =
+        document.getElementById(
+            "activeChatAvatar"
+        );
+
+
+    const messages =
+        document.getElementById(
+            "messages"
+        );
+
+
+    const messageForm =
+        document.getElementById(
+            "messageForm"
+        );
+
+
+    const messageInput =
+        document.getElementById(
+            "messageInput"
+        );
+
+
+    const chatSearch =
+        document.getElementById(
+            "chatSearch"
+        );
+
+
+
+    /*
+        Current selected contact.
+    */
+
+    let activeContact =
+        "Elkurios";
+
+
+
+    /*
+        Temporary chat messages.
+
+        REAL chat will later use:
+        Node.js
+        Express
+        PostgreSQL
+    */
+
+    const chatMessages = {
+
+        "Elkurios": [
+
+            {
+                type: "received",
+                text:
+                    "Hi! Welcome to Kurios Stores. How can we help you?",
+                sender:
+                    "Elkurios"
+            },
+
+            {
+                type: "sent",
+                text:
+                    "Hello! I want to know if you have phone chargers available.",
+                sender:
+                    "You"
+            },
+
+            {
+                type: "received",
+                text:
+                    "Yes, we do. You can check our Electronics section.",
+                sender:
+                    "Elkurios"
+            }
+
+        ],
+
+
+        "Chisom": [],
+
+        "Daniel": []
+
+    };
+
+
+
+    function displayChat(contact) {
+
+
+        if (!messages) {
+            return;
+        }
+
+
+        messages.innerHTML = "";
+
+
+
+        const conversation =
+            chatMessages[contact] || [];
+
+
+
+        conversation.forEach(
+            function (message) {
+
+
+                const messageElement =
+                    document.createElement(
+                        "div"
+                    );
+
+
+                messageElement.className =
+                    "message " +
+                    message.type;
+
+
+                messageElement.innerHTML = `
+
+                    <div class="message-bubble">
+
+                        ${message.text}
+
+                    </div>
+
+                    <span>
+
+                        ${message.sender}
+
+                    </span>
+
+                `;
+
+
+                messages.appendChild(
+                    messageElement
+                );
+
+            }
+        );
+
+
+
+        /*
+            Automatically scroll
+            to the latest message.
+        */
+
+        messages.scrollTop =
+            messages.scrollHeight;
+
+    }
+
+
+
+    /*
+        Selecting a student or
+        Elkurios changes the conversation.
+    */
+
+    chatContacts.forEach(
+        function (contact) {
+
+
+            contact.addEventListener(
+                "click",
+                function () {
+
+
+                    chatContacts.forEach(
+                        function (item) {
+
+                            item.classList.remove(
+                                "active"
+                            );
+
+                        }
+                    );
+
+
+                    contact.classList.add(
+                        "active"
+                    );
+
+
+                    activeContact =
+                        contact.dataset.contact;
+
+
+                    if (activeChatName) {
+
+                        activeChatName.textContent =
+                            activeContact;
+
+                    }
+
+
+                    if (activeChatStatus) {
+
+                        activeChatStatus.textContent =
+                            activeContact ===
+                            "Elkurios"
+                                ? "Store Owner"
+                                : "Student";
+
+                    }
+
+
+                    if (activeChatAvatar) {
+
+                        activeChatAvatar.textContent =
+                            activeContact
+                                .charAt(0)
+                                .toUpperCase();
+
+                    }
+
+
+                    displayChat(
+                        activeContact
+                    );
+
+                }
+            );
+
+        }
+    );
+
+
+
+    /*
+        Send a message.
+    */
+
+    if (messageForm) {
+
+        messageForm.addEventListener(
+            "submit",
+            function (event) {
+
+                event.preventDefault();
+
+
+                if (!messageInput) {
+                    return;
+                }
+
+
+                const text =
+                    messageInput.value.trim();
+
+
+                if (text === "") {
+                    return;
+                }
+
+
+
+                if (
+                    !chatMessages[
+                        activeContact
+                    ]
+                ) {
+
+                    chatMessages[
+                        activeContact
+                    ] = [];
+
+                }
+
+
+
+                chatMessages[
+                    activeContact
+                ].push({
+
+                    type: "sent",
+
+                    text: text,
+
+                    sender: "You"
+
+                });
+
+
+
+                messageInput.value = "";
+
+
+                displayChat(
+                    activeContact
+                );
+
+            }
+        );
+
+    }
+
+
+
+    /* =====================================================
+       16. CHAT SEARCH
+       ===================================================== */
+
+
+    if (chatSearch) {
+
+        chatSearch.addEventListener(
+            "input",
+            function () {
+
+
+                const search =
+                    chatSearch.value
+                        .toLowerCase()
+                        .trim();
+
+
+
+                chatContacts.forEach(
+                    function (contact) {
+
+
+                        const name =
+                            contact.dataset.contact
+                                .toLowerCase();
+
+
+                        if (
+                            name.includes(search)
+                        ) {
+
+                            contact.style.display =
+                                "";
+
+                        }
+
+                        else {
+
+                            contact.style.display =
+                                "none";
+
+                        }
+
+                    }
+                );
+
+            }
+        );
+
+    }
+
+
+
+    /* =====================================================
+       17. NEW CHAT BUTTON
+       ===================================================== */
+
+
+    const newChatButton =
+        document.getElementById(
+            "newChatButton"
+        );
+
+
+    if (newChatButton) {
+
+        newChatButton.addEventListener(
+            "click",
+            function () {
+
+                showMessage(
+                    "New chat system will connect to registered students."
+                );
+
+            }
+        );
+
+    }
+
+
+
+    /* =====================================================
+       18. ELKURIOS BROADCAST
+       ===================================================== */
+
+
+    const broadcastForm =
+        document.getElementById(
+            "broadcastForm"
+        );
+
+
+    const broadcastModal =
+        document.getElementById(
+            "broadcastModal"
+        );
+
+
+    const closeBroadcast =
+        document.getElementById(
+            "closeBroadcast"
+        );
+
+
+
+    if (closeBroadcast) {
+
+        closeBroadcast.addEventListener(
+            "click",
+            function () {
+
+                if (broadcastModal) {
+
+                    broadcastModal.classList.remove(
+                        "active"
+                    );
+
+                }
+
+            }
+        );
+
+    }
+
+
+
+    /*
+        IMPORTANT:
+
+        This currently demonstrates
+        the frontend behaviour only.
+
+        The real broadcast system will be
+        connected to PostgreSQL and Node.js
+        after we create the notification API.
+    */
+
+    if (broadcastForm) {
+
+        broadcastForm.addEventListener(
+            "submit",
+            function (event) {
+
+                event.preventDefault();
+
+
+                const title =
+                    document.getElementById(
+                        "broadcastTitle"
+                    ).value.trim();
+
+
+                const message =
+                    document.getElementById(
+                        "broadcastMessage"
+                    ).value.trim();
+
+
+
+                if (
+                    title === "" ||
+                    message === ""
+                ) {
+
+                    showMessage(
+                        "Please enter a title and message."
+                    );
+
+                    return;
+
+                }
+
+
+
+                /*
+                    Add a temporary notification
+                    to this browser.
+                */
+
+                notifications.unshift({
+
+                    title: title,
+
+                    message: message
+
+                });
+
+
+
+                saveNotifications();
+
+                renderNotifications();
+
+
+
+                showMessage(
+                    "Announcement created. The real all-students broadcast API comes next."
+                );
+
+
+
+                broadcastForm.reset();
+
+            }
+        );
+
+    }
+
+
+
+    /* =====================================================
+       19. CHECKOUT
+       ===================================================== */
+
+
+    if (checkoutButton) {
+
+        checkoutButton.addEventListener(
+            "click",
+            async function () {
+
+
+                if (
+                    cart.length === 0
+                ) {
+
+                    showMessage(
+                        "Your cart is empty."
+                    );
+
+                    return;
+
+                }
+
+
+                // ========================================
+                // MUST BE SIGNED IN TO CHECK OUT
+                // ========================================
+
+                const student =
+                    getLoggedInStudent();
+
+                if (!student) {
+
+                    closeCartPanel();
+
+                    showMessage(
+                        "Please sign in to check out."
+                    );
+
+                    openSignInModal();
+
+                    return;
+
+                }
+
+
+                checkoutButton.disabled = true;
+
+                checkoutButton.textContent =
+                    "Starting checkout...";
+
+
+                try {
+
+                    // ========================================
+                    // START THE ORDER ON OUR SERVER
+                    // (server recalculates the real total —
+                    // never trust prices from the browser)
+                    // ========================================
+
+                    const initiateResponse =
+                        await fetch(
+                            API_URL + "/api/orders/initiate",
+                            {
+                                method: "POST",
+                                headers: {
+                                    "Content-Type": "application/json"
+                                },
+                                body: JSON.stringify({
+                                    studentId: student.id,
+                                    items: cart,
+                                    customerName:
+                                        `${student.first_name || ""} ${student.last_name || ""}`.trim(),
+                                    customerEmail: student.email
+                                })
+                            }
+                        );
+
+                    const initiateData =
+                        await initiateResponse.json();
+
+                    if (!initiateData.success) {
+
+                        showMessage(
+                            initiateData.message ||
+                            "Could not start checkout."
+                        );
+
+                        return;
+
+                    }
+
+
+                    // ========================================
+                    // HAND OFF TO THE MONNIFY PAYMENT WIDGET
+                    // ========================================
+
+                    closeCartPanel();
+
+                    if (typeof MonnifySDK === "undefined") {
+
+                        showMessage(
+                            "Payment could not load. Please refresh and try again."
+                        );
+
+                        return;
+
+                    }
+
+                    MonnifySDK.initialize({
+
+                        amount: initiateData.amount,
+
+                        currency: "NGN",
+
+                        reference: initiateData.paymentReference,
+
+                        customerFullName:
+                            initiateData.customerName,
+
+                        customerEmail:
+                            initiateData.customerEmail,
+
+                        apiKey: initiateData.apiKey,
+
+                        contractCode: initiateData.contractCode,
+
+                        paymentDescription:
+                            "Kurios Stores order",
+
+                        onComplete: async function () {
+
+                            await verifyOrderPayment(
+                                initiateData.paymentReference
+                            );
+
+                        },
+
+                        onClose: function () {
+
+                            // Student closed the widget without
+                            // finishing — we'll still catch a
+                            // completed payment via the webhook,
+                            // so nothing else to do here.
+
+                        }
+
+                    });
+
+                } catch (error) {
+
+                    console.error(
+                        "Checkout error:",
+                        error
+                    );
+
+                    showMessage(
+                        "Could not reach the server. Please try again."
+                    );
+
+                } finally {
+
+                    checkoutButton.disabled = false;
+
+                    checkoutButton.textContent =
+                        "Proceed to Checkout";
+
+                }
+
+            }
+        );
+
+    }
+
+
+    // ========================================
+    // CONFIRM A PAYMENT WITH OUR SERVER
+    // (never trust the widget's onComplete alone)
+    // ========================================
+
+    async function verifyOrderPayment(paymentReference) {
 
         try {
 
-            const {
-                studentId,
-                phone,
-                dateOfBirth
-            } = req.body;
-
-
-            // ====================================
-            // VALIDATE INPUT
-            // ====================================
-
-            if (!studentId) {
-
-                return res.status(400).json({
-                    success: false,
-                    message: "We couldn't tell which account to update."
-                });
-
-            }
-
-
-            const newProfilePicturePath =
-                req.file ?
-                    "/uploads/" + req.file.filename :
-                    null;
-
-
-            if (!phone && !dateOfBirth && !newProfilePicturePath) {
-
-                return res.status(400).json({
-                    success: false,
-                    message: "Nothing was provided to update."
-                });
-
-            }
-
-
-            // ====================================
-            // LOOK UP THE CURRENT RECORD
-            // (so we know the old picture to remove,
-            // and to fall back to existing values)
-            // ====================================
-
-            const currentResult = await pool.query(
-                `
-                SELECT
-                    id,
-                    phone,
-                    date_of_birth,
-                    profile_picture
-                FROM students
-                WHERE id = $1
-                LIMIT 1
-                `,
-                [studentId]
-            );
-
-            if (currentResult.rows.length === 0) {
-
-                return res.status(404).json({
-                    success: false,
-                    message: "Student account could not be found."
-                });
-
-            }
-
-            const currentStudent =
-                currentResult.rows[0];
-
-
-            // ====================================
-            // UPDATE THE RECORD
-            // ====================================
-
-            const updatedResult = await pool.query(
-                `
-                UPDATE students
-                SET
-                    phone = $1,
-                    date_of_birth = $2,
-                    profile_picture = $3,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = $4
-                RETURNING
-                    id,
-                    first_name,
-                    last_name,
-                    email,
-                    phone,
-                    whatsapp_number,
-                    university,
-                    student_id,
-                    date_of_birth,
-                    profile_picture,
-                    email_verified
-                `,
-                [
-                    phone ?
-                        phone.trim() :
-                        currentStudent.phone,
-
-                    dateOfBirth ?
-                        dateOfBirth :
-                        currentStudent.date_of_birth,
-
-                    newProfilePicturePath ?
-                        newProfilePicturePath :
-                        currentStudent.profile_picture,
-
-                    studentId
-                ]
-            );
-
-
-            // ====================================
-            // REMOVE THE OLD PROFILE PICTURE
-            // (only once the new one is safely saved)
-            // ====================================
-
-            if (
-                newProfilePicturePath &&
-                currentStudent.profile_picture
-            ) {
-
-                const oldFilePath = path.join(
-                    uploadsFolder,
-                    path.basename(currentStudent.profile_picture)
+            const response =
+                await fetch(
+                    API_URL + "/api/orders/verify",
+                    {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json"
+                        },
+                        body: JSON.stringify({
+                            paymentReference: paymentReference
+                        })
+                    }
                 );
 
-                fs.unlink(oldFilePath, function (error) {
+            const data =
+                await response.json();
 
-                    if (error) {
+            if (data.success) {
 
-                        console.error(
-                            "Could not remove old profile picture:",
-                            error.message
+                cart = [];
+
+                saveCart();
+
+                updateCart();
+
+                showMessage(
+                    "Payment confirmed! Your order has been placed."
+                );
+
+            } else {
+
+                showMessage(
+                    "We couldn't confirm your payment yet. Check My Orders shortly, or contact support if this continues."
+                );
+
+            }
+
+        } catch (error) {
+
+            console.error(
+                "Payment verification error:",
+                error
+            );
+
+            showMessage(
+                "We couldn't confirm your payment. Check My Orders shortly, or contact support if this continues."
+            );
+
+        }
+
+    }
+
+
+
+    /* =====================================================
+       20. FOOTER INTERACTIONS
+       ===================================================== */
+
+
+    const socialLinks =
+        document.querySelectorAll(
+            ".social-links a"
+        );
+
+
+    socialLinks.forEach(
+        function (link) {
+
+            link.addEventListener(
+                "click",
+                function (event) {
+
+                    event.preventDefault();
+
+
+                    const label =
+                        link.getAttribute(
+                            "aria-label"
+                        ) ||
+                        "Social media";
+
+
+                    showMessage(
+                        label +
+                        " link will be connected soon."
+                    );
+
+                }
+            );
+
+        }
+    );
+
+
+
+    /*
+        Footer policy links.
+    */
+
+    const privacyLink =
+        document.getElementById(
+            "privacyLink"
+        );
+
+
+    const termsLink =
+        document.getElementById(
+            "termsLink"
+        );
+
+
+    const refundLink =
+        document.getElementById(
+            "refundLink"
+        );
+
+
+
+    if (privacyLink) {
+
+        privacyLink.addEventListener(
+            "click",
+            function (event) {
+
+                event.preventDefault();
+
+                showMessage(
+                    "Privacy Policy page coming soon."
+                );
+
+            }
+        );
+
+    }
+
+
+
+    if (termsLink) {
+
+        termsLink.addEventListener(
+            "click",
+            function (event) {
+
+                event.preventDefault();
+
+                showMessage(
+                    "Terms of Service page coming soon."
+                );
+
+            }
+        );
+
+    }
+
+
+
+    if (refundLink) {
+
+        refundLink.addEventListener(
+            "click",
+            function (event) {
+
+                event.preventDefault();
+
+                showMessage(
+                    "Refund Policy page coming soon."
+                );
+
+            }
+        );
+
+    }
+
+
+
+    /* =====================================================
+       21. FOOTER HEART
+       ===================================================== */
+
+
+    const footerHeart =
+        document.querySelector(
+            ".footer-love i"
+        );
+
+
+    if (footerHeart) {
+
+        footerHeart.addEventListener(
+            "click",
+            function () {
+
+
+                footerHeart.classList.toggle(
+                    "fa-regular"
+                );
+
+
+                footerHeart.classList.toggle(
+                    "fa-solid"
+                );
+
+
+                showMessage(
+                    "Together for a greater campus ❤️"
+                );
+
+            }
+        );
+
+    }
+
+
+
+    /* =====================================================
+       22. GENERAL MESSAGE / TOAST
+       ===================================================== */
+
+
+    function showMessage(message) {
+
+
+        /*
+            Create a toast notification.
+        */
+
+        let toast =
+            document.getElementById(
+                "kuriosToast"
+            );
+
+
+
+        /*
+            If the toast doesn't exist,
+            create it.
+        */
+
+        if (!toast) {
+
+            toast =
+                document.createElement(
+                    "div"
+                );
+
+
+            toast.id =
+                "kuriosToast";
+
+
+            toast.className =
+                "kurios-toast";
+
+
+            document.body.appendChild(
+                toast
+            );
+
+        }
+
+
+
+        toast.textContent =
+            message;
+
+
+        toast.classList.add(
+            "show"
+        );
+
+
+
+        /*
+            Remove it after 3 seconds.
+        */
+
+        setTimeout(
+            function () {
+
+                toast.classList.remove(
+                    "show"
+                );
+
+            },
+            3000
+        );
+
+    }
+
+
+
+    /* =====================================================
+       23. SMOOTH SCROLLING
+       ===================================================== */
+
+
+    document.querySelectorAll(
+        'a[href^="#"]'
+    ).forEach(
+        function (link) {
+
+
+            link.addEventListener(
+                "click",
+                function (event) {
+
+
+                    const targetId =
+                        link.getAttribute(
+                            "href"
                         );
+
+
+                    if (
+                        !targetId ||
+                        targetId === "#"
+                    ) {
+
+                        return;
+
+                    }
+
+
+                    /*
+                        Don't interfere with
+                        modal links.
+                    */
+
+                    if (
+                        targetId ===
+                        "#signin"
+                    ) {
+
+                        event.preventDefault();
+
+                        openSignInModal();
+
+                        return;
+
+                    }
+
+
+
+                    const target =
+                        document.querySelector(
+                            targetId
+                        );
+
+
+                    if (target) {
+
+                        event.preventDefault();
+
+
+                        target.scrollIntoView({
+
+                            behavior: "smooth",
+
+                            block: "start"
+
+                        });
+
+                    }
+
+                }
+            );
+
+        }
+    );
+
+
+
+    /* =====================================================
+       24. INITIALIZE EVERYTHING
+       ===================================================== */
+
+
+    /*
+        Show saved cart.
+    */
+
+    updateCart();
+
+
+
+    /*
+        Show saved notifications.
+    */
+
+    renderNotifications();
+
+
+
+    /*
+        Show Elkurios conversation.
+    */
+
+    displayChat(
+        "Elkurios"
+    );
+
+
+
+    /*
+        IMPORTANT:
+
+        This is where the frontend
+        contacts our Node.js backend.
+    */
+
+    loadProducts();
+
+
+});
+
+/* =========================================
+   SIGN UP MODAL
+========================================= */
+
+const signUpModal =
+    document.getElementById("signUpModal");
+
+const openSignUp =
+    document.getElementById("openSignUp");
+
+const closeSignUp =
+    document.getElementById("closeSignUp");
+
+const backToSignIn =
+    document.getElementById("backToSignIn");
+
+
+/* OPEN SIGN UP */
+
+if (openSignUp) {
+
+    openSignUp.addEventListener(
+        "click",
+        function(event) {
+
+            event.preventDefault();
+
+            if (signInModal) {
+                signInModal.classList.remove("open");
+            }
+
+            if (signUpModal) {
+                signUpModal.classList.add("open");
+            }
+
+        }
+    );
+
+}
+
+
+/* CLOSE SIGN UP */
+
+if (closeSignUp) {
+
+    closeSignUp.addEventListener(
+        "click",
+        function() {
+
+            if (signUpModal) {
+                signUpModal.classList.remove("open");
+            }
+
+        }
+    );
+
+}
+
+
+/* BACK TO SIGN IN */
+
+if (backToSignIn) {
+
+    backToSignIn.addEventListener(
+        "click",
+        function(event) {
+
+            event.preventDefault();
+
+            if (signUpModal) {
+                signUpModal.classList.remove("open");
+            }
+
+            if (signInModal) {
+                signInModal.classList.add("open");
+            }
+
+        }
+    );
+
+}
+
+/* =========================================
+   SIGNUP MODAL SCROLLBAR
+========================================= */
+
+const signupModalContent =
+    document.querySelector("#signUpModal .auth-modal");
+
+let signupScrollbarTimer;
+
+if (signupModalContent) {
+
+    signupModalContent.addEventListener(
+        "scroll",
+        function () {
+
+            // Show scrollbar while scrolling
+            signupModalContent.classList.add(
+                "is-scrolling"
+            );
+
+            // Reset the timer
+            clearTimeout(
+                signupScrollbarTimer
+            );
+
+            // Hide scrollbar after scrolling stops
+            signupScrollbarTimer = setTimeout(
+                function () {
+
+                    signupModalContent.classList.remove(
+                        "is-scrolling"
+                    );
+
+                },
+                700
+            );
+
+        }
+    );
+
+}
+
+// ========================================
+// STUDENT EMAIL OTP VERIFICATION
+// ========================================
+
+let currentStudentId = null;
+let currentStudentEmail = null;
+
+
+// ========================================
+// OTP ELEMENTS
+// ========================================
+
+const otpScreen =
+    document.getElementById("otpVerificationScreen");
+
+const otpDigits =
+    document.querySelectorAll(".otp-digit");
+
+const otpInput =
+    document.getElementById("otpInput");
+
+const verifyOtpButton =
+    document.getElementById("verifyOtpButton");
+
+const resendOtpButton =
+    document.getElementById("resendOtpButton");
+
+const otpStatusMessage =
+    document.getElementById("otpStatusMessage");
+
+
+// ========================================
+// SHOW OTP VERIFICATION SCREEN
+// ========================================
+
+function showOtpVerificationScreen(studentId, email) {
+
+    currentStudentId = studentId;
+    currentStudentEmail = email;
+
+
+    // ========================================
+    // HIDE SIGNUP FORM
+    // ========================================
+
+    const signupForm =
+        document.getElementById("signupForm");
+
+    if (signupForm) {
+
+        signupForm.style.display = "none";
+
+    }
+
+
+    // ========================================
+    // SHOW OTP SCREEN
+    // ========================================
+
+    if (otpScreen) {
+
+        otpScreen.style.display = "block";
+
+    }
+
+
+    // ========================================
+    // UPDATE EMAIL MESSAGE
+    // ========================================
+
+    const otpMessage =
+        document.getElementById(
+            "otpVerificationMessage"
+        );
+
+    if (otpMessage) {
+
+        otpMessage.innerHTML = `
+            We've sent a 6-digit verification code to
+            <strong>${email}</strong>.<br><br>
+            Please enter the code below to activate
+            your account.
+        `;
+
+    }
+
+
+    // ========================================
+    // CLEAR OTP BOXES
+    // ========================================
+
+    otpDigits.forEach(function (input) {
+
+        input.value = "";
+
+    });
+
+
+    if (otpInput) {
+
+        otpInput.value = "";
+
+    }
+
+
+    // ========================================
+    // CLEAR STATUS
+    // ========================================
+
+    if (otpStatusMessage) {
+
+        otpStatusMessage.textContent = "";
+
+    }
+
+
+    // ========================================
+    // FOCUS FIRST BOX
+    // ========================================
+
+    if (otpDigits.length > 0) {
+
+        otpDigits[0].focus();
+
+    }
+
+}
+
+
+// ========================================
+// UPDATE COMBINED OTP
+// ========================================
+
+function updateCombinedOtp() {
+
+    let combinedOtp = "";
+
+    otpDigits.forEach(function (input) {
+
+        combinedOtp += input.value;
+
+    });
+
+
+    if (otpInput) {
+
+        otpInput.value = combinedOtp;
+
+    }
+
+
+    return combinedOtp;
+
+}
+
+
+// ========================================
+// OTP BOX INPUT HANDLING
+// ========================================
+
+otpDigits.forEach(function (input, index) {
+
+
+    // ========================================
+    // INPUT
+    // ========================================
+
+    input.addEventListener(
+        "input",
+        function () {
+
+            // Numbers only
+            this.value =
+                this.value.replace(/\D/g, "");
+
+
+            // Keep only one digit
+            if (this.value.length > 1) {
+
+                this.value =
+                    this.value.slice(-1);
+
+            }
+
+
+            // Update hidden OTP
+            updateCombinedOtp();
+
+
+            // Move to next box
+            if (
+                this.value &&
+                index < otpDigits.length - 1
+            ) {
+
+                otpDigits[index + 1].focus();
+
+            }
+
+        }
+    );
+
+
+    // ========================================
+    // KEYBOARD HANDLING
+    // ========================================
+
+    input.addEventListener(
+        "keydown",
+        function (event) {
+
+
+            // Backspace
+            if (
+                event.key === "Backspace" &&
+                !this.value &&
+                index > 0
+            ) {
+
+                otpDigits[index - 1].focus();
+
+            }
+
+
+            // Left arrow
+            if (
+                event.key === "ArrowLeft" &&
+                index > 0
+            ) {
+
+                otpDigits[index - 1].focus();
+
+            }
+
+
+            // Right arrow
+            if (
+                event.key === "ArrowRight" &&
+                index < otpDigits.length - 1
+            ) {
+
+                otpDigits[index + 1].focus();
+
+            }
+
+        }
+    );
+
+
+    // ========================================
+    // PASTE COMPLETE OTP
+    // ========================================
+
+    input.addEventListener(
+        "paste",
+        function (event) {
+
+            event.preventDefault();
+
+            const pastedText =
+                event.clipboardData
+                    .getData("text")
+                    .replace(/\D/g, "")
+                    .slice(0, 6);
+
+
+            if (!pastedText) {
+
+                return;
+
+            }
+
+
+            pastedText
+                .split("")
+                .forEach(function (digit, digitIndex) {
+
+                    if (
+                        otpDigits[digitIndex]
+                    ) {
+
+                        otpDigits[digitIndex].value =
+                            digit;
 
                     }
 
                 });
 
+
+            updateCombinedOtp();
+
+
+            const focusIndex =
+                Math.min(
+                    pastedText.length,
+                    otpDigits.length - 1
+                );
+
+            if (otpDigits[focusIndex]) {
+
+                otpDigits[focusIndex].focus();
+
+            }
+
+        }
+    );
+
+});
+
+
+// ========================================
+// VERIFY OTP
+// ========================================
+
+if (verifyOtpButton) {
+
+    verifyOtpButton.addEventListener(
+        "click",
+        async function () {
+
+
+            // ========================================
+            // COMBINE OTP
+            // ========================================
+
+            const otp =
+                updateCombinedOtp();
+
+
+            // ========================================
+            // CLEAR PREVIOUS STATUS
+            // ========================================
+
+            if (otpStatusMessage) {
+
+                otpStatusMessage.textContent = "";
+
             }
 
 
-            // ====================================
-            // SUCCESS
-            // ====================================
+            // ========================================
+            // VALIDATE OTP
+            // ========================================
 
-            res.status(200).json({
+            if (!/^\d{6}$/.test(otp)) {
 
-                success: true,
+                if (otpStatusMessage) {
 
-                message: "Profile updated successfully.",
+                    otpStatusMessage.textContent =
+                        "Please enter the complete 6-digit verification code.";
 
-                student: updatedResult.rows[0]
+                }
 
-            });
+                return;
 
-        } catch (error) {
+            }
 
-            console.error(
-                "Profile update error:",
-                error.message
-            );
 
-            res.status(500).json({
+            // ========================================
+            // CHECK STUDENT ID
+            // ========================================
 
-                success: false,
+            if (!currentStudentId) {
 
-                message:
-                    "Something went wrong while updating your profile."
+                if (otpStatusMessage) {
 
-            });
+                    otpStatusMessage.textContent =
+                        "Your verification session has expired. Please restart registration.";
+
+                }
+
+                return;
+
+            }
+
+
+            // ========================================
+            // DISABLE VERIFY BUTTON
+            // ========================================
+
+            verifyOtpButton.disabled = true;
+
+            verifyOtpButton.innerHTML = `
+                <span class="otp-button-icon">
+                    <i class="fa-solid fa-spinner fa-spin"></i>
+                </span>
+
+                <span class="otp-button-text">
+                    Verifying...
+                </span>
+
+                <span class="otp-button-arrow">
+                    <i class="fa-solid fa-spinner fa-spin"></i>
+                </span>
+            `;
+
+
+            try {
+
+
+                // ========================================
+                // SEND OTP TO BACKEND
+                // ========================================
+
+                const response =
+                    await fetch(
+                        API_URL + "/api/students/verify-otp",
+                        {
+
+                            method: "POST",
+
+                            headers: {
+
+                                "Content-Type":
+                                    "application/json"
+
+                            },
+
+                            body: JSON.stringify({
+
+                                studentId:
+                                    currentStudentId,
+
+                                otp:
+                                    otp
+
+                            })
+
+                        }
+                    );
+
+
+                // ========================================
+                // READ RESPONSE
+                // ========================================
+
+                const data =
+                    await response.json();
+
+
+                // ========================================
+                // INVALID OTP
+                // ========================================
+
+                if (
+                    !response.ok ||
+                    !data.success
+                ) {
+
+                    if (otpStatusMessage) {
+
+                        otpStatusMessage.textContent =
+                            data.message ||
+                            "Invalid or expired verification code.";
+
+                    }
+
+
+                    verifyOtpButton.disabled =
+                        false;
+
+
+                    verifyOtpButton.innerHTML = `
+                        <span class="otp-button-icon">
+                            <i class="fa-solid fa-shield-halved"></i>
+                        </span>
+
+                        <span class="otp-button-text">
+                            Verify Account
+                        </span>
+
+                        <span class="otp-button-arrow">
+                            <i class="fa-solid fa-arrow-right"></i>
+                        </span>
+                    `;
+
+
+                    return;
+
+                }
+
+
+                // ========================================
+                // SUCCESS
+                // ========================================
+
+                console.log(
+                    "Student email verified successfully:",
+                    data.student
+                );
+
+
+                if (otpStatusMessage) {
+
+                    otpStatusMessage.textContent =
+                        "Email verified successfully!";
+
+                }
+
+
+                // ========================================
+                // HIDE OTP SCREEN
+                // ========================================
+
+                if (otpScreen) {
+
+                    otpScreen.style.display =
+                        "none";
+
+                }
+
+
+                // ========================================
+                // UPDATE MODAL TITLE
+                // ========================================
+
+                const accountModalTitle =
+                    document.getElementById(
+                        "accountModalTitle"
+                    );
+
+                if (accountModalTitle) {
+
+                    accountModalTitle.textContent =
+                        "Account Created Successfully! 🎉";
+
+                }
+
+
+                // ========================================
+                // HIDE MODAL SUBTITLE
+                // ========================================
+
+                const accountModalSubtitle =
+                    document.getElementById(
+                        "accountModalSubtitle"
+                    );
+
+                if (accountModalSubtitle) {
+
+                    accountModalSubtitle.style.display =
+                        "none";
+
+                }
+
+
+                // ========================================
+                // SHOW SUCCESS SCREEN
+                // ========================================
+
+                const successScreen =
+                    document.getElementById(
+                        "accountCreatedSuccessScreen"
+                    );
+
+                if (successScreen) {
+
+                    successScreen.style.display =
+                        "block";
+
+                }
+
+
+                // ========================================
+                // RESET OTP
+                // ========================================
+
+                otpDigits.forEach(
+                    function (input) {
+
+                        input.value = "";
+
+                    }
+                );
+
+
+                if (otpInput) {
+
+                    otpInput.value = "";
+
+                }
+
+
+            } catch (error) {
+
+                console.error(
+                    "OTP verification error:",
+                    error
+                );
+
+
+                if (otpStatusMessage) {
+
+                    otpStatusMessage.textContent =
+                        "Unable to connect to Kurios Stores server. Please try again.";
+
+                }
+
+
+                verifyOtpButton.disabled =
+                    false;
+
+
+                verifyOtpButton.innerHTML = `
+                    <span class="otp-button-icon">
+                        <i class="fa-solid fa-shield-halved"></i>
+                    </span>
+
+                    <span class="otp-button-text">
+                        Verify Account
+                    </span>
+
+                    <span class="otp-button-arrow">
+                        <i class="fa-solid fa-arrow-right"></i>
+                    </span>
+                `;
+
+            }
 
         }
-
-    }
-);
-
-
-// ========================================
-// CHECKOUT + ORDERS (MONNIFY)
-// ========================================
-
-/*
-    Recomputes the order total from the real
-    products table — never trust a price sent
-    from the browser.
-*/
-
-async function buildTrustedOrderItems(items) {
-
-    const productIds =
-        items.map(function (item) {
-            return item.id;
-        });
-
-    const productsResult = await pool.query(
-        `
-        SELECT id, name, price
-        FROM products
-        WHERE id = ANY($1::int[])
-        `,
-        [productIds]
     );
-
-    const productMap = {};
-
-    productsResult.rows.forEach(function (product) {
-        productMap[product.id] = product;
-    });
-
-    let totalAmount = 0;
-    const trustedItems = [];
-
-    for (const item of items) {
-
-        const product = productMap[item.id];
-
-        if (!product) {
-
-            throw new Error(
-                "One of the items in your cart is no longer available."
-            );
-
-        }
-
-        const quantity =
-            Math.max(
-                1,
-                parseInt(item.quantity) || 1
-            );
-
-        const lineTotal =
-            Number(product.price) * quantity;
-
-        totalAmount += lineTotal;
-
-        trustedItems.push({
-            id: product.id,
-            name: product.name,
-            price: Number(product.price),
-            quantity: quantity
-        });
-
-    }
-
-    return {
-        totalAmount,
-        trustedItems
-    };
 
 }
 
 
-/*
-    Asks Monnify for the real status of a
-    payment and updates our own orders table
-    to match. Used by both the manual "verify
-    after checkout" call and the webhook.
-*/
+// ========================================
+// RESEND OTP
+// ========================================
 
-async function verifyAndUpdateOrder(paymentReference) {
+if (resendOtpButton) {
 
-    const orderResult = await pool.query(
-        `
-        SELECT *
-        FROM orders
-        WHERE payment_reference = $1
-        LIMIT 1
-        `,
-        [paymentReference]
-    );
-
-    if (orderResult.rows.length === 0) {
-
-        return {
-            success: false,
-            message: "Order not found.",
-            order: null
-        };
-
-    }
-
-    const order =
-        orderResult.rows[0];
+    resendOtpButton.addEventListener(
+        "click",
+        async function () {
 
 
-    // Already confirmed earlier — no need to ask Monnify again.
+            // ========================================
+            // CHECK SESSION
+            // ========================================
 
-    if (order.status === "paid") {
+            if (
+                !currentStudentId ||
+                !currentStudentEmail
+            ) {
 
-        return {
-            success: true,
-            message: "Payment already confirmed.",
-            order: order
-        };
+                if (otpStatusMessage) {
 
-    }
+                    otpStatusMessage.textContent =
+                        "Unable to resend OTP. Please restart registration.";
+
+                }
+
+                return;
+
+            }
 
 
-    const accessToken =
-        await getMonnifyAccessToken();
+            // ========================================
+            // DISABLE RESEND BUTTON
+            // ========================================
 
-    const verifyResponse = await fetch(
-        MONNIFY_BASE_URL +
-        "/api/v2/merchant/transactions/query?paymentReference=" +
-        encodeURIComponent(paymentReference),
-        {
-            headers: {
-                "Authorization": "Bearer " + accessToken
-            },
-            signal: AbortSignal.timeout(15000)
+            resendOtpButton.disabled =
+                true;
+
+            resendOtpButton.innerHTML = `
+                <i class="fa-solid fa-spinner fa-spin"></i>
+                <span>Sending...</span>
+            `;
+
+
+            try {
+
+
+                // ========================================
+                // SEND RESEND REQUEST
+                // ========================================
+
+                const response =
+                    await fetch(
+                        API_URL + "/api/students/resend-otp",
+                        {
+
+                            method: "POST",
+
+                            headers: {
+
+                                "Content-Type":
+                                    "application/json"
+
+                            },
+
+                            body: JSON.stringify({
+
+                                studentId:
+                                    currentStudentId,
+
+                                email:
+                                    currentStudentEmail
+
+                            })
+
+                        }
+                    );
+
+
+                // ========================================
+                // READ RESPONSE
+                // ========================================
+
+                const data =
+                    await response.json();
+
+
+                // ========================================
+                // HANDLE ERROR
+                // ========================================
+
+                if (
+                    !response.ok ||
+                    !data.success
+                ) {
+
+                    if (otpStatusMessage) {
+
+                        otpStatusMessage.textContent =
+                            data.message ||
+                            "Unable to resend verification code.";
+
+                    }
+
+                    return;
+
+                }
+
+
+                // ========================================
+                // RESEND SUCCESS
+                // ========================================
+
+                if (otpStatusMessage) {
+
+                    otpStatusMessage.textContent =
+                        "A new verification code has been sent to your email.";
+
+                }
+
+
+                // ========================================
+                // CLEAR OTP BOXES
+                // ========================================
+
+                otpDigits.forEach(
+                    function (input) {
+
+                        input.value = "";
+
+                    }
+                );
+
+
+                if (otpInput) {
+
+                    otpInput.value = "";
+
+                }
+
+
+                // ========================================
+                // FOCUS FIRST BOX
+                // ========================================
+
+                if (otpDigits.length > 0) {
+
+                    otpDigits[0].focus();
+
+                }
+
+
+            } catch (error) {
+
+                console.error(
+                    "Resend OTP error:",
+                    error
+                );
+
+
+                if (otpStatusMessage) {
+
+                    otpStatusMessage.textContent =
+                        "Unable to connect to Kurios Stores server.";
+
+                }
+
+            } finally {
+
+
+                // ========================================
+                // RESTORE RESEND BUTTON
+                // ========================================
+
+                resendOtpButton.disabled =
+                    false;
+
+                resendOtpButton.innerHTML = `
+                    <i class="fa-solid fa-rotate"></i>
+
+                    <span>
+                        Resend OTP
+                    </span>
+                `;
+
+            }
+
         }
     );
-
-    const verifyData =
-        await verifyResponse.json();
-
-    if (!verifyData.requestSuccessful) {
-
-        return {
-            success: false,
-            message: "Could not verify this payment with Monnify.",
-            order: order
-        };
-
-    }
-
-
-    const paymentStatus =
-        verifyData.responseBody.paymentStatus;
-
-    const amountPaid =
-        Number(verifyData.responseBody.amountPaid || 0);
-
-    const transactionReference =
-        verifyData.responseBody.transactionReference;
-
-    const isPaid =
-        (paymentStatus === "PAID" || paymentStatus === "OVERPAID") &&
-        amountPaid >= Number(order.amount);
-
-    const isFailed =
-        paymentStatus === "FAILED" ||
-        paymentStatus === "EXPIRED" ||
-        paymentStatus === "REVERSED";
-
-    const newStatus =
-        isPaid ?
-            "paid" :
-            isFailed ?
-                "failed" :
-                "pending";
-
-    const updatedResult = await pool.query(
-        `
-        UPDATE orders
-        SET
-            status = $1,
-            transaction_reference = $2,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = $3
-        RETURNING *
-        `,
-        [
-            newStatus,
-            transactionReference,
-            order.id
-        ]
-    );
-
-    return {
-        success: isPaid,
-        message:
-            isPaid ?
-                "Payment confirmed." :
-                "Payment status: " + paymentStatus,
-        order: updatedResult.rows[0]
-    };
 
 }
 
 
 // ========================================
-// START A CHECKOUT
+// SUCCESS SCREEN → LOGIN
 // ========================================
 
-app.post("/api/orders/initiate", async (req, res) => {
+const successLoginLink =
+    document.getElementById(
+        "successLoginLink"
+    );
 
-    try {
+if (successLoginLink) {
 
-        const {
-            studentId,
-            items,
-            customerName,
-            customerEmail
-        } = req.body;
+    successLoginLink.addEventListener(
+        "click",
+        function (event) {
 
-        if (
-            !studentId ||
-            !Array.isArray(items) ||
-            items.length === 0
-        ) {
+            event.preventDefault();
 
-            return res.status(400).json({
-                success: false,
-                message: "Your cart is empty."
-            });
+
+            // ========================================
+            // HIDE SUCCESS SCREEN
+            // ========================================
+
+            const successScreen =
+                document.getElementById(
+                    "accountCreatedSuccessScreen"
+                );
+
+            if (successScreen) {
+
+                successScreen.style.display =
+                    "none";
+
+            }
+
+
+            // ========================================
+            // SHOW SIGN IN FORM
+            // ========================================
+
+            const signinForm =
+                document.getElementById(
+                    "signinForm"
+                );
+
+            if (signinForm) {
+
+                signinForm.style.display =
+                    "block";
+
+            }
+
+
+            // ========================================
+            // UPDATE MODAL TITLE
+            // ========================================
+
+            const accountModalTitle =
+                document.getElementById(
+                    "accountModalTitle"
+                );
+
+            if (accountModalTitle) {
+
+                accountModalTitle.textContent =
+                    "Welcome Back";
+
+            }
+
+
+            // ========================================
+            // SHOW SIGN IN SUBTITLE
+            // ========================================
+
+            const accountModalSubtitle =
+                document.getElementById(
+                    "accountModalSubtitle"
+                );
+
+            if (accountModalSubtitle) {
+
+                accountModalSubtitle.style.display =
+                    "block";
+
+                accountModalSubtitle.textContent =
+                    "Sign in to your Kurios Stores account.";
+
+            }
 
         }
+    );
 
-
-        let totalAmount;
-        let trustedItems;
-
-        try {
-
-            const built =
-                await buildTrustedOrderItems(items);
-
-            totalAmount = built.totalAmount;
-            trustedItems = built.trustedItems;
-
-        } catch (buildError) {
-
-            return res.status(400).json({
-                success: false,
-                message: buildError.message
-            });
-
-        }
-
-
-        if (totalAmount <= 0) {
-
-            return res.status(400).json({
-                success: false,
-                message: "Order total must be greater than zero."
-            });
-
-        }
-
-
-        const paymentReference =
-            "kurios_" +
-            Date.now() +
-            "_" +
-            crypto.randomInt(100000, 999999);
-
-        await pool.query(
-            `
-            INSERT INTO orders (
-                student_id,
-                payment_reference,
-                items,
-                amount,
-                status
-            )
-            VALUES ($1, $2, $3, $4, 'pending')
-            `,
-            [
-                studentId,
-                paymentReference,
-                JSON.stringify(trustedItems),
-                totalAmount
-            ]
-        );
-
-
-        res.status(200).json({
-
-            success: true,
-
-            paymentReference: paymentReference,
-
-            amount: totalAmount,
-
-            apiKey: MONNIFY_API_KEY,
-
-            contractCode: MONNIFY_CONTRACT_CODE,
-
-            customerName: customerName || "Kurios Student",
-
-            customerEmail: customerEmail || ""
-
-        });
-
-    } catch (error) {
-
-        console.error(
-            "Order initiate error:",
-            error.message
-        );
-
-        res.status(500).json({
-            success: false,
-            message: "Something went wrong while starting your order."
-        });
-
-    }
-
-});
-
-
-// ========================================
-// VERIFY A CHECKOUT (called right after
-// the Monnify widget closes)
-// ========================================
-
-app.post("/api/orders/verify", async (req, res) => {
-
-    try {
-
-        const { paymentReference } =
-            req.body;
-
-        if (!paymentReference) {
-
-            return res.status(400).json({
-                success: false,
-                message: "Missing payment reference."
-            });
-
-        }
-
-        const result =
-            await verifyAndUpdateOrder(
-                paymentReference
-            );
-
-        if (!result.order) {
-
-            return res.status(404).json(result);
-
-        }
-
-        res.status(200).json(result);
-
-    } catch (error) {
-
-        console.error(
-            "Order verify error:",
-            error.message
-        );
-
-        res.status(500).json({
-            success: false,
-            message: "Something went wrong while verifying your payment."
-        });
-
-    }
-
-});
-
-
-// ========================================
-// MONNIFY WEBHOOK
-// (catches payments even if the student
-// closes the browser before we can verify)
-// ========================================
-
-app.post("/api/orders/webhook", async (req, res) => {
-
-    try {
-
-        const paymentReference =
-            req.body &&
-            req.body.eventData &&
-            req.body.eventData.paymentReference;
-
-        if (!paymentReference) {
-
-            // Nothing we recognise — acknowledge
-            // anyway so Monnify doesn't keep retrying.
-
-            return res.status(200).send("ignored");
-
-        }
-
-        await verifyAndUpdateOrder(
-            paymentReference
-        );
-
-        res.status(200).send("ok");
-
-    } catch (error) {
-
-        console.error(
-            "Monnify webhook error:",
-            error.message
-        );
-
-        // Still 200 — Monnify will retry on non-2xx,
-        // and we don't want a retry storm over a bug
-        // on our side. We'll catch it on next verify.
-
-        res.status(200).send("error logged");
-
-    }
-
-});
-
-
-// ========================================
-// LIST A STUDENT'S ORDERS
-// ========================================
-
-app.get("/api/orders", async (req, res) => {
-
-    try {
-
-        const { studentId } =
-            req.query;
-
-        if (!studentId) {
-
-            return res.status(400).json({
-                success: false,
-                message: "Missing studentId."
-            });
-
-        }
-
-        const result = await pool.query(
-            `
-            SELECT
-                id,
-                payment_reference,
-                items,
-                amount,
-                status,
-                created_at
-            FROM orders
-            WHERE student_id = $1
-            ORDER BY created_at DESC
-            `,
-            [studentId]
-        );
-
-        res.status(200).json({
-            success: true,
-            orders: result.rows
-        });
-
-    } catch (error) {
-
-        console.error(
-            "Fetch orders error:",
-            error.message
-        );
-
-        res.status(500).json({
-            success: false,
-            message: "Could not load your orders."
-        });
-
-    }
-
-});
-
-
-
-
-// ========================================
-// START SERVER
-// ========================================
-
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-    console.log(`Kurios Stores server is running on port ${PORT}`);
-});
+}
