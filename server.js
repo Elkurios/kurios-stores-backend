@@ -474,6 +474,178 @@ async function ensureSellersTableExists() {
 
 
 // ========================================
+// ADMINS + ADMIN SESSIONS
+// ========================================
+
+async function ensureAdminTablesExist() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS admins (
+                id SERIAL PRIMARY KEY,
+                name TEXT,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                id SERIAL PRIMARY KEY,
+                admin_id INTEGER REFERENCES admins(id),
+                token TEXT UNIQUE NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        console.log(
+            "Admin tables are ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not create admin tables:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
+// SEED THE FIRST ADMIN ACCOUNT
+// (from environment variables, only if
+// there are no admins yet)
+// ========================================
+
+/*
+    Put these in your Render Environment Variables
+    to create your first admin account automatically:
+
+    ADMIN_EMAIL=you@example.com
+    ADMIN_PASSWORD=choose-a-strong-password
+
+    After the first admin exists, these env vars are
+    no longer used — manage further admins directly
+    in the database, or extend this later with an
+    "invite another admin" feature.
+*/
+
+async function seedInitialAdmin() {
+
+    try {
+
+        const existing =
+            await pool.query(`SELECT id FROM admins LIMIT 1`);
+
+        if (existing.rows.length > 0) {
+            return;
+        }
+
+        if (!process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD) {
+
+            console.log(
+                "No admin account yet — set ADMIN_EMAIL and ADMIN_PASSWORD to create one."
+            );
+
+            return;
+
+        }
+
+        const passwordHash =
+            await bcrypt.hash(process.env.ADMIN_PASSWORD, 12);
+
+        await pool.query(
+            `
+            INSERT INTO admins (name, email, password_hash)
+            VALUES ($1, $2, $3)
+            `,
+            [
+                "Kurios Admin",
+                process.env.ADMIN_EMAIL.trim().toLowerCase(),
+                passwordHash
+            ]
+        );
+
+        console.log(
+            "Initial admin account created for " + process.env.ADMIN_EMAIL
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not seed initial admin:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
+// SELLER PAYMENT COLUMNS
+// (application fee tracking)
+// ========================================
+
+async function ensureSellerPaymentColumnsExist() {
+
+    try {
+
+        await pool.query(
+            `
+            ALTER TABLE sellers
+            ADD COLUMN IF NOT EXISTS application_fee NUMERIC(12, 2) DEFAULT 1500
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE sellers
+            ADD COLUMN IF NOT EXISTS payment_reference TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE sellers
+            ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'unpaid'
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE sellers
+            ADD COLUMN IF NOT EXISTS transaction_reference TEXT
+            `
+        );
+
+        console.log(
+            "Seller payment columns are ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not add seller payment columns:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
 // RUN ALL MIGRATIONS, IN ORDER
 // ========================================
 
@@ -491,6 +663,9 @@ async function runMigrations() {
     await ensureProfileColumnsExist();
     await ensureOrdersTableExists();
     await ensureSellersTableExists();
+    await ensureSellerPaymentColumnsExist();
+    await ensureAdminTablesExist();
+    await seedInitialAdmin();
 
 }
 
@@ -2830,9 +3005,19 @@ app.post("/api/orders/webhook", async (req, res) => {
 
         }
 
-        await verifyAndUpdateOrder(
-            paymentReference
-        );
+        if (paymentReference.startsWith("kurios_seller_")) {
+
+            await verifyAndUpdateSellerPayment(
+                paymentReference
+            );
+
+        } else {
+
+            await verifyAndUpdateOrder(
+                paymentReference
+            );
+
+        }
 
         res.status(200).send("ok");
 
@@ -2915,52 +3100,181 @@ app.get("/api/orders", async (req, res) => {
 
 
 // ========================================
-// ADMIN KEY PROTECTION
-// (used for all /api/admin/* routes)
+// ADMIN LOGIN
+// ========================================
+
+app.post("/api/admin/login", async (req, res) => {
+
+    try {
+
+        const { email, password } = req.body;
+
+        if (!email || !password) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Email and password are required."
+            });
+
+        }
+
+        const adminResult = await pool.query(
+            `
+            SELECT id, name, email, password_hash
+            FROM admins
+            WHERE LOWER(email) = LOWER($1)
+            LIMIT 1
+            `,
+            [email.trim()]
+        );
+
+        if (adminResult.rows.length === 0) {
+
+            return res.status(401).json({
+                success: false,
+                message: "Invalid email or password."
+            });
+
+        }
+
+        const admin = adminResult.rows[0];
+
+        const passwordMatches =
+            await bcrypt.compare(password, admin.password_hash);
+
+        if (!passwordMatches) {
+
+            return res.status(401).json({
+                success: false,
+                message: "Invalid email or password."
+            });
+
+        }
+
+
+        // ====================================
+        // CREATE A SESSION TOKEN
+        // (valid for 7 days)
+        // ====================================
+
+        const token =
+            crypto.randomBytes(32).toString("hex");
+
+        const expiresAt =
+            new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+        await pool.query(
+            `
+            INSERT INTO admin_sessions (admin_id, token, expires_at)
+            VALUES ($1, $2, $3)
+            `,
+            [admin.id, token, expiresAt]
+        );
+
+        res.status(200).json({
+
+            success: true,
+
+            message: "Welcome back.",
+
+            token: token,
+
+            admin: {
+                id: admin.id,
+                name: admin.name,
+                email: admin.email
+            }
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Admin login error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Something went wrong while signing you in."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ADMIN AUTH MIDDLEWARE
+// (used for all other /api/admin/* routes)
 // ========================================
 
 /*
-    Put this in your Render Environment Variables:
+    Requests must include the session token
+    returned by /api/admin/login as a header:
 
-    ADMIN_KEY=some-long-random-secret
-
-    Requests to admin routes must include it as
-    a header: x-admin-key: <the same secret>
-
-    This is a basic first line of defence, not a
-    full admin login system — good enough while
-    only you (the store owner) use it, but should
-    be replaced with real admin accounts before
-    handing admin access to anyone else.
+    Authorization: Bearer <token>
 */
 
-function requireAdminKey(req, res, next) {
+async function requireAdminAuth(req, res, next) {
 
-    const providedKey =
-        req.header("x-admin-key");
+    try {
 
-    if (!process.env.ADMIN_KEY) {
+        const authHeader =
+            req.header("authorization") || "";
 
-        return res.status(500).json({
+        const token =
+            authHeader.startsWith("Bearer ") ?
+                authHeader.slice(7).trim() :
+                null;
+
+        if (!token) {
+
+            return res.status(401).json({
+                success: false,
+                message: "Please sign in as an admin."
+            });
+
+        }
+
+        const sessionResult = await pool.query(
+            `
+            SELECT admin_sessions.admin_id, admins.name, admins.email
+            FROM admin_sessions
+            JOIN admins ON admins.id = admin_sessions.admin_id
+            WHERE admin_sessions.token = $1
+            AND admin_sessions.expires_at > NOW()
+            LIMIT 1
+            `,
+            [token]
+        );
+
+        if (sessionResult.rows.length === 0) {
+
+            return res.status(401).json({
+                success: false,
+                message: "Your admin session has expired. Please sign in again."
+            });
+
+        }
+
+        req.admin = sessionResult.rows[0];
+
+        next();
+
+    } catch (error) {
+
+        console.error(
+            "Admin auth check error:",
+            error.message
+        );
+
+        res.status(500).json({
             success: false,
-            message: "Admin access is not configured on the server yet."
+            message: "Could not verify admin session."
         });
 
     }
-
-    if (
-        !providedKey ||
-        providedKey !== process.env.ADMIN_KEY
-    ) {
-
-        return res.status(401).json({
-            success: false,
-            message: "Invalid admin key."
-        });
-
-    }
-
-    next();
 
 }
 
@@ -3012,7 +3326,12 @@ app.post("/api/sellers/apply", async (req, res) => {
         // ====================================
 
         const studentCheck = await pool.query(
-            `SELECT id FROM students WHERE id = $1 LIMIT 1`,
+            `
+            SELECT id, first_name, last_name, email
+            FROM students
+            WHERE id = $1
+            LIMIT 1
+            `,
             [studentId]
         );
 
@@ -3025,6 +3344,8 @@ app.post("/api/sellers/apply", async (req, res) => {
 
         }
 
+        const student = studentCheck.rows[0];
+
 
         // ====================================
         // BLOCK DUPLICATE ACTIVE APPLICATIONS
@@ -3032,10 +3353,10 @@ app.post("/api/sellers/apply", async (req, res) => {
 
         const existingCheck = await pool.query(
             `
-            SELECT id, status
+            SELECT *
             FROM sellers
             WHERE student_id = $1
-            AND status IN ('pending', 'approved')
+            AND status IN ('pending', 'approved', 'pending_payment')
             ORDER BY created_at DESC
             LIMIT 1
             `,
@@ -3046,21 +3367,60 @@ app.post("/api/sellers/apply", async (req, res) => {
 
             const existing = existingCheck.rows[0];
 
-            return res.status(409).json({
-                success: false,
-                message:
-                    existing.status === "approved" ?
-                        "You're already an approved seller." :
-                        "You already have a pending seller application.",
-                status: existing.status
+            if (existing.status !== "pending_payment") {
+
+                return res.status(409).json({
+                    success: false,
+                    message:
+                        existing.status === "approved" ?
+                            "You're already an approved seller." :
+                            "You already have a pending seller application.",
+                    status: existing.status
+                });
+
+            }
+
+            // An unpaid application already exists — resume
+            // it with the same payment reference instead of
+            // creating a duplicate row.
+
+            return res.status(200).json({
+
+                success: true,
+
+                message: "Continue to payment to submit your application.",
+
+                seller: existing,
+
+                paymentReference: existing.payment_reference,
+
+                amount: Number(existing.application_fee),
+
+                apiKey: MONNIFY_API_KEY,
+
+                contractCode: MONNIFY_CONTRACT_CODE,
+
+                customerName:
+                    `${student.first_name || ""} ${student.last_name || ""}`.trim(),
+
+                customerEmail: student.email
+
             });
 
         }
 
 
         // ====================================
-        // SAVE APPLICATION
+        // SAVE APPLICATION (AWAITING PAYMENT)
         // ====================================
+
+        const applicationFee = 1500;
+
+        const paymentReference =
+            "kurios_seller_" +
+            Date.now() +
+            "_" +
+            crypto.randomInt(100000, 999999);
 
         const result = await pool.query(
             `
@@ -3073,9 +3433,12 @@ app.post("/api/sellers/apply", async (req, res) => {
                 location,
                 contact_phone,
                 contact_whatsapp,
-                status
+                status,
+                application_fee,
+                payment_reference,
+                payment_status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending_payment', $9, $10, 'unpaid')
             RETURNING *
             `,
             [
@@ -3086,7 +3449,9 @@ app.post("/api/sellers/apply", async (req, res) => {
                 businessCategory ? businessCategory.trim() : null,
                 location ? location.trim() : null,
                 contactPhone ? contactPhone.trim() : null,
-                contactWhatsapp ? contactWhatsapp.trim() : null
+                contactWhatsapp ? contactWhatsapp.trim() : null,
+                applicationFee,
+                paymentReference
             ]
         );
 
@@ -3095,9 +3460,22 @@ app.post("/api/sellers/apply", async (req, res) => {
             success: true,
 
             message:
-                "Your seller application has been submitted for review.",
+                "Pay the application fee to submit your application.",
 
-            seller: result.rows[0]
+            seller: result.rows[0],
+
+            paymentReference: paymentReference,
+
+            amount: applicationFee,
+
+            apiKey: MONNIFY_API_KEY,
+
+            contractCode: MONNIFY_CONTRACT_CODE,
+
+            customerName:
+                `${student.first_name || ""} ${student.last_name || ""}`.trim(),
+
+            customerEmail: student.email
 
         });
 
@@ -3111,6 +3489,165 @@ app.post("/api/sellers/apply", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Something went wrong while submitting your application."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// VERIFY A SELLER APPLICATION FEE PAYMENT
+// ========================================
+
+async function verifyAndUpdateSellerPayment(paymentReference) {
+
+    const sellerResult = await pool.query(
+        `
+        SELECT *
+        FROM sellers
+        WHERE payment_reference = $1
+        LIMIT 1
+        `,
+        [paymentReference]
+    );
+
+    if (sellerResult.rows.length === 0) {
+
+        return {
+            success: false,
+            message: "Seller application not found.",
+            seller: null
+        };
+
+    }
+
+    const seller =
+        sellerResult.rows[0];
+
+    if (seller.payment_status === "paid") {
+
+        return {
+            success: true,
+            message: "Payment already confirmed.",
+            seller: seller
+        };
+
+    }
+
+    const accessToken =
+        await getMonnifyAccessToken();
+
+    const verifyResponse = await fetch(
+        MONNIFY_BASE_URL +
+        "/api/v2/merchant/transactions/query?paymentReference=" +
+        encodeURIComponent(paymentReference),
+        {
+            headers: {
+                "Authorization": "Bearer " + accessToken
+            },
+            signal: AbortSignal.timeout(15000)
+        }
+    );
+
+    const verifyData =
+        await verifyResponse.json();
+
+    if (!verifyData.requestSuccessful) {
+
+        return {
+            success: false,
+            message: "Could not verify this payment with Monnify.",
+            seller: seller
+        };
+
+    }
+
+    const paymentStatus =
+        verifyData.responseBody.paymentStatus;
+
+    const amountPaid =
+        Number(verifyData.responseBody.amountPaid || 0);
+
+    const transactionReference =
+        verifyData.responseBody.transactionReference;
+
+    const isPaid =
+        (paymentStatus === "PAID" || paymentStatus === "OVERPAID") &&
+        amountPaid >= Number(seller.application_fee);
+
+    const isFailed =
+        paymentStatus === "FAILED" ||
+        paymentStatus === "EXPIRED" ||
+        paymentStatus === "REVERSED";
+
+    const updatedResult = await pool.query(
+        `
+        UPDATE sellers
+        SET
+            payment_status = $1,
+            status = $2,
+            transaction_reference = $3,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $4
+        RETURNING *
+        `,
+        [
+            isPaid ? "paid" : (isFailed ? "failed" : "unpaid"),
+            isPaid ? "pending" : "pending_payment",
+            transactionReference,
+            seller.id
+        ]
+    );
+
+    return {
+        success: isPaid,
+        message:
+            isPaid ?
+                "Payment confirmed. Your application is now under review." :
+                "Payment status: " + paymentStatus,
+        seller: updatedResult.rows[0]
+    };
+
+}
+
+
+app.post("/api/sellers/apply/verify-payment", async (req, res) => {
+
+    try {
+
+        const { paymentReference } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const result =
+            await verifyAndUpdateSellerPayment(paymentReference);
+
+        if (!result.seller) {
+
+            return res.status(404).json(result);
+
+        }
+
+        res.status(200).json(result);
+
+    } catch (error) {
+
+        console.error(
+            "Seller payment verify error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Something went wrong while verifying your payment."
         });
 
     }
@@ -3176,7 +3713,7 @@ app.get("/api/sellers/me", async (req, res) => {
 
 app.get(
     "/api/admin/sellers",
-    requireAdminKey,
+    requireAdminAuth,
     async (req, res) => {
 
         try {
@@ -3296,19 +3833,19 @@ async function updateSellerStatus(req, res, newStatus) {
 
 app.post(
     "/api/admin/sellers/:id/approve",
-    requireAdminKey,
+    requireAdminAuth,
     (req, res) => updateSellerStatus(req, res, "approved")
 );
 
 app.post(
     "/api/admin/sellers/:id/reject",
-    requireAdminKey,
+    requireAdminAuth,
     (req, res) => updateSellerStatus(req, res, "rejected")
 );
 
 app.post(
     "/api/admin/sellers/:id/suspend",
-    requireAdminKey,
+    requireAdminAuth,
     (req, res) => updateSellerStatus(req, res, "suspended")
 );
 
