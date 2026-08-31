@@ -432,6 +432,47 @@ async function ensureOrdersTableExists() {
 }
 
 
+async function ensureSellersTableExists() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS sellers (
+                id SERIAL PRIMARY KEY,
+                student_id INTEGER REFERENCES students(id),
+                seller_type TEXT NOT NULL DEFAULT 'student_seller',
+                store_name TEXT NOT NULL,
+                store_description TEXT,
+                business_category TEXT,
+                location TEXT,
+                store_image TEXT,
+                contact_phone TEXT,
+                contact_whatsapp TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                rejection_reason TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        console.log(
+            "Sellers table is ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not create sellers table:",
+            error.message
+        );
+
+    }
+
+}
+
+
 // ========================================
 // RUN ALL MIGRATIONS, IN ORDER
 // ========================================
@@ -449,6 +490,7 @@ async function runMigrations() {
     await ensureBaseTablesExist();
     await ensureProfileColumnsExist();
     await ensureOrdersTableExists();
+    await ensureSellersTableExists();
 
 }
 
@@ -2870,6 +2912,405 @@ app.get("/api/orders", async (req, res) => {
 });
 
 
+
+
+// ========================================
+// ADMIN KEY PROTECTION
+// (used for all /api/admin/* routes)
+// ========================================
+
+/*
+    Put this in your Render Environment Variables:
+
+    ADMIN_KEY=some-long-random-secret
+
+    Requests to admin routes must include it as
+    a header: x-admin-key: <the same secret>
+
+    This is a basic first line of defence, not a
+    full admin login system — good enough while
+    only you (the store owner) use it, but should
+    be replaced with real admin accounts before
+    handing admin access to anyone else.
+*/
+
+function requireAdminKey(req, res, next) {
+
+    const providedKey =
+        req.header("x-admin-key");
+
+    if (!process.env.ADMIN_KEY) {
+
+        return res.status(500).json({
+            success: false,
+            message: "Admin access is not configured on the server yet."
+        });
+
+    }
+
+    if (
+        !providedKey ||
+        providedKey !== process.env.ADMIN_KEY
+    ) {
+
+        return res.status(401).json({
+            success: false,
+            message: "Invalid admin key."
+        });
+
+    }
+
+    next();
+
+}
+
+
+const VALID_SELLER_TYPES = [
+    "student_seller",
+    "vendor",
+    "restaurant",
+    "service_provider"
+];
+
+
+// ========================================
+// APPLY TO BECOME A SELLER
+// ========================================
+
+app.post("/api/sellers/apply", async (req, res) => {
+
+    try {
+
+        const {
+            studentId,
+            sellerType,
+            storeName,
+            storeDescription,
+            businessCategory,
+            location,
+            contactPhone,
+            contactWhatsapp
+        } = req.body;
+
+        if (!studentId || !storeName) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please provide at least a store name."
+            });
+
+        }
+
+        const resolvedSellerType =
+            VALID_SELLER_TYPES.includes(sellerType) ?
+                sellerType :
+                "student_seller";
+
+
+        // ====================================
+        // CONFIRM STUDENT EXISTS
+        // ====================================
+
+        const studentCheck = await pool.query(
+            `SELECT id FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (studentCheck.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Student account could not be found."
+            });
+
+        }
+
+
+        // ====================================
+        // BLOCK DUPLICATE ACTIVE APPLICATIONS
+        // ====================================
+
+        const existingCheck = await pool.query(
+            `
+            SELECT id, status
+            FROM sellers
+            WHERE student_id = $1
+            AND status IN ('pending', 'approved')
+            ORDER BY created_at DESC
+            LIMIT 1
+            `,
+            [studentId]
+        );
+
+        if (existingCheck.rows.length > 0) {
+
+            const existing = existingCheck.rows[0];
+
+            return res.status(409).json({
+                success: false,
+                message:
+                    existing.status === "approved" ?
+                        "You're already an approved seller." :
+                        "You already have a pending seller application.",
+                status: existing.status
+            });
+
+        }
+
+
+        // ====================================
+        // SAVE APPLICATION
+        // ====================================
+
+        const result = await pool.query(
+            `
+            INSERT INTO sellers (
+                student_id,
+                seller_type,
+                store_name,
+                store_description,
+                business_category,
+                location,
+                contact_phone,
+                contact_whatsapp,
+                status
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+            RETURNING *
+            `,
+            [
+                studentId,
+                resolvedSellerType,
+                storeName.trim(),
+                storeDescription ? storeDescription.trim() : null,
+                businessCategory ? businessCategory.trim() : null,
+                location ? location.trim() : null,
+                contactPhone ? contactPhone.trim() : null,
+                contactWhatsapp ? contactWhatsapp.trim() : null
+            ]
+        );
+
+        res.status(201).json({
+
+            success: true,
+
+            message:
+                "Your seller application has been submitted for review.",
+
+            seller: result.rows[0]
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Seller application error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Something went wrong while submitting your application."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// GET MY SELLER STATUS
+// ========================================
+
+app.get("/api/sellers/me", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT *
+            FROM sellers
+            WHERE student_id = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            `,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            seller: result.rows[0] || null
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch seller status error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not check your seller status."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ADMIN — LIST SELLERS
+// ========================================
+
+app.get(
+    "/api/admin/sellers",
+    requireAdminKey,
+    async (req, res) => {
+
+        try {
+
+            const { status } = req.query;
+
+            const validStatuses =
+                ["pending", "approved", "rejected", "suspended"];
+
+            let query =
+                `
+                SELECT
+                    sellers.*,
+                    students.first_name,
+                    students.last_name,
+                    students.email AS student_email,
+                    students.university
+                FROM sellers
+                JOIN students ON students.id = sellers.student_id
+                `;
+
+            const params = [];
+
+            if (status && validStatuses.includes(status)) {
+
+                query += ` WHERE sellers.status = $1`;
+                params.push(status);
+
+            }
+
+            query += ` ORDER BY sellers.created_at DESC`;
+
+            const result =
+                await pool.query(query, params);
+
+            res.status(200).json({
+                success: true,
+                sellers: result.rows
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Admin list sellers error:",
+                error.message
+            );
+
+            res.status(500).json({
+                success: false,
+                message: "Could not load sellers."
+            });
+
+        }
+
+    }
+);
+
+
+// ========================================
+// ADMIN — APPROVE / REJECT / SUSPEND A SELLER
+// ========================================
+
+async function updateSellerStatus(req, res, newStatus) {
+
+    try {
+
+        const { id } = req.params;
+        const { reason } = req.body;
+
+        const result = await pool.query(
+            `
+            UPDATE sellers
+            SET
+                status = $1,
+                rejection_reason = $2,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = $3
+            RETURNING *
+            `,
+            [
+                newStatus,
+                newStatus === "rejected" ? (reason || null) : null,
+                id
+            ]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Seller application could not be found."
+            });
+
+        }
+
+        res.status(200).json({
+            success: true,
+            message: "Seller status updated to " + newStatus + ".",
+            seller: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Update seller status error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not update seller status."
+        });
+
+    }
+
+}
+
+app.post(
+    "/api/admin/sellers/:id/approve",
+    requireAdminKey,
+    (req, res) => updateSellerStatus(req, res, "approved")
+);
+
+app.post(
+    "/api/admin/sellers/:id/reject",
+    requireAdminKey,
+    (req, res) => updateSellerStatus(req, res, "rejected")
+);
+
+app.post(
+    "/api/admin/sellers/:id/suspend",
+    requireAdminKey,
+    (req, res) => updateSellerStatus(req, res, "suspended")
+);
 
 
 // ========================================
