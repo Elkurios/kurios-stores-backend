@@ -1005,6 +1005,13 @@ async function ensureProductSellerColumnsExist() {
             `
         );
 
+        await pool.query(
+            `
+            ALTER TABLE sellers
+            ADD COLUMN IF NOT EXISTS is_official BOOLEAN DEFAULT false
+            `
+        );
+
         console.log(
             "Product seller columns are ready."
         );
@@ -1013,6 +1020,94 @@ async function ensureProductSellerColumnsExist() {
 
         console.error(
             "Could not add product seller columns:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
+// SEED KURIOS STORES AS AN APPROVED SELLER
+// ========================================
+
+/*
+    Kurios Stores' own products (added directly,
+    not through a student's seller application)
+    belong to this seller row so they show "Sold
+    by Kurios Stores" and get a real storefront
+    page like any other seller — instead of being
+    a special, unattributed case.
+
+    This has no student_id (it isn't owned by a
+    student account), skips the application fee,
+    and is approved by default.
+*/
+
+async function seedKuriosStoresSeller() {
+
+    try {
+
+        const existing = await pool.query(
+            `
+            SELECT id
+            FROM sellers
+            WHERE is_official = true
+            LIMIT 1
+            `
+        );
+
+        let kuriosSellerId;
+
+        if (existing.rows.length > 0) {
+
+            kuriosSellerId = existing.rows[0].id;
+
+        } else {
+
+            const inserted = await pool.query(
+                `
+                INSERT INTO sellers (
+                    student_id,
+                    seller_type,
+                    store_name,
+                    store_description,
+                    status,
+                    application_fee,
+                    payment_status,
+                    is_official
+                )
+                VALUES (NULL, 'vendor', 'Kurios Stores', 'Official Kurios Stores products.', 'approved', 0, 'paid', true)
+                RETURNING id
+                `
+            );
+
+            kuriosSellerId = inserted.rows[0].id;
+
+            console.log(
+                "Seeded Kurios Stores as an approved seller (id " + kuriosSellerId + ")."
+            );
+
+        }
+
+
+        // Attach any pre-existing, unattributed
+        // products to Kurios Stores.
+
+        await pool.query(
+            `
+            UPDATE products
+            SET seller_id = $1
+            WHERE seller_id IS NULL
+            `,
+            [kuriosSellerId]
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not seed Kurios Stores seller:",
             error.message
         );
 
@@ -1045,6 +1140,7 @@ async function runMigrations() {
     await seedInitialAdmin();
     await ensureNotificationsTableExists();
     await ensureProductSellerColumnsExist();
+    await seedKuriosStoresSeller();
 
 }
 
@@ -3969,7 +4065,7 @@ app.post("/api/sellers/apply/pay/monnify", async (req, res) => {
             `
             SELECT sellers.*, students.first_name, students.last_name, students.email
             FROM sellers
-            JOIN students ON students.id = sellers.student_id
+            LEFT JOIN students ON students.id = sellers.student_id
             WHERE sellers.payment_reference = $1
             LIMIT 1
             `,
@@ -4052,7 +4148,7 @@ app.post("/api/sellers/apply/pay/opay", async (req, res) => {
             `
             SELECT sellers.*, students.first_name, students.last_name, students.email
             FROM sellers
-            JOIN students ON students.id = sellers.student_id
+            LEFT JOIN students ON students.id = sellers.student_id
             WHERE sellers.payment_reference = $1
             LIMIT 1
             `,
@@ -4409,7 +4505,7 @@ app.get(
                     students.email AS student_email,
                     students.university
                 FROM sellers
-                JOIN students ON students.id = sellers.student_id
+                LEFT JOIN students ON students.id = sellers.student_id
                 `;
 
             const params = [];
@@ -4798,6 +4894,387 @@ async function getApprovedSeller(studentId) {
     return result.rows[0] || null;
 
 }
+
+
+// ========================================
+// UPLOAD YOUR OWN STORE LOGO
+// (approved sellers only)
+// ========================================
+
+app.post(
+    "/api/sellers/logo",
+    function (req, res, next) {
+
+        productImageUpload.single("logo")(
+            req,
+            res,
+            function (error) {
+
+                if (error) {
+
+                    return res.status(400).json({
+                        success: false,
+                        message: error.message
+                    });
+
+                }
+
+                next();
+
+            }
+        );
+
+    },
+    async (req, res) => {
+
+        try {
+
+            const { studentId } = req.body;
+
+            if (!studentId) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Missing studentId."
+                });
+
+            }
+
+            if (!req.file) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Please choose a logo image."
+                });
+
+            }
+
+            const seller =
+                await getApprovedSeller(studentId);
+
+            if (!seller) {
+
+                return res.status(403).json({
+                    success: false,
+                    message: "Only approved sellers can upload a store logo."
+                });
+
+            }
+
+            const newImageUrl =
+                "/uploads/" + req.file.filename;
+
+            const updatedResult = await pool.query(
+                `
+                UPDATE sellers
+                SET store_image = $1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = $2
+                RETURNING *
+                `,
+                [newImageUrl, seller.id]
+            );
+
+            if (seller.store_image) {
+
+                const oldImagePath =
+                    path.join(
+                        uploadsFolder,
+                        path.basename(seller.store_image)
+                    );
+
+                fs.unlink(oldImagePath, function () {});
+
+            }
+
+            res.status(200).json({
+                success: true,
+                message: "Store logo updated.",
+                seller: updatedResult.rows[0]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Seller logo upload error:",
+                error.message
+            );
+
+            res.status(500).json({
+                success: false,
+                message: "Could not update your store logo."
+            });
+
+        }
+
+    }
+);
+
+
+// ========================================
+// ADMIN — UPDATE ANY SELLER'S LOGO
+// (also how Kurios Stores' own logo is set,
+// since it has no student account behind it)
+// ========================================
+
+app.post(
+    "/api/admin/sellers/:id/logo",
+    requireAdminAuth,
+    function (req, res, next) {
+
+        productImageUpload.single("logo")(
+            req,
+            res,
+            function (error) {
+
+                if (error) {
+
+                    return res.status(400).json({
+                        success: false,
+                        message: error.message
+                    });
+
+                }
+
+                next();
+
+            }
+        );
+
+    },
+    async (req, res) => {
+
+        try {
+
+            const { id } = req.params;
+
+            if (!req.file) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Please choose a logo image."
+                });
+
+            }
+
+            const currentResult = await pool.query(
+                `SELECT * FROM sellers WHERE id = $1 LIMIT 1`,
+                [id]
+            );
+
+            if (currentResult.rows.length === 0) {
+
+                return res.status(404).json({
+                    success: false,
+                    message: "Seller not found."
+                });
+
+            }
+
+            const currentSeller =
+                currentResult.rows[0];
+
+            const newImageUrl =
+                "/uploads/" + req.file.filename;
+
+            const updatedResult = await pool.query(
+                `
+                UPDATE sellers
+                SET store_image = $1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = $2
+                RETURNING *
+                `,
+                [newImageUrl, id]
+            );
+
+            if (currentSeller.store_image) {
+
+                const oldImagePath =
+                    path.join(
+                        uploadsFolder,
+                        path.basename(currentSeller.store_image)
+                    );
+
+                fs.unlink(oldImagePath, function () {});
+
+            }
+
+            res.status(200).json({
+                success: true,
+                message: "Store logo updated.",
+                seller: updatedResult.rows[0]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Admin seller logo upload error:",
+                error.message
+            );
+
+            res.status(500).json({
+                success: false,
+                message: "Could not update this store's logo."
+            });
+
+        }
+
+    }
+);
+
+
+// ========================================
+// GET THE KURIOS STORES SELLER RECORD
+// (so the admin page knows its ID)
+// ========================================
+
+app.get(
+    "/api/admin/kurios-store",
+    requireAdminAuth,
+    async (req, res) => {
+
+        try {
+
+            const result = await pool.query(
+                `
+                SELECT
+                    sellers.*,
+                    students.first_name AS linked_first_name,
+                    students.last_name AS linked_last_name,
+                    students.email AS linked_email
+                FROM sellers
+                LEFT JOIN students ON students.id = sellers.student_id
+                WHERE sellers.is_official = true
+                LIMIT 1
+                `
+            );
+
+            if (result.rows.length === 0) {
+
+                return res.status(404).json({
+                    success: false,
+                    message: "Kurios Stores seller record not found."
+                });
+
+            }
+
+            res.status(200).json({
+                success: true,
+                seller: result.rows[0]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Fetch Kurios Stores seller error:",
+                error.message
+            );
+
+            res.status(500).json({
+                success: false,
+                message: "Could not load Kurios Stores seller record."
+            });
+
+        }
+
+    }
+);
+
+
+// ========================================
+// LINK KURIOS STORES TO A STUDENT ACCOUNT
+// (so that student can manage it through
+// the normal seller dashboard, instead of
+// only through this admin page)
+// ========================================
+
+app.post(
+    "/api/admin/kurios-store/link",
+    requireAdminAuth,
+    async (req, res) => {
+
+        try {
+
+            const { identifier } = req.body;
+
+            if (!identifier) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Please provide the student's email."
+                });
+
+            }
+
+            const studentResult = await pool.query(
+                `
+                SELECT id, first_name, last_name, email
+                FROM students
+                WHERE LOWER(email) = LOWER($1)
+                LIMIT 1
+                `,
+                [identifier.trim()]
+            );
+
+            if (studentResult.rows.length === 0) {
+
+                return res.status(404).json({
+                    success: false,
+                    message: "No student account found with that email."
+                });
+
+            }
+
+            const student =
+                studentResult.rows[0];
+
+            const kuriosResult = await pool.query(
+                `
+                UPDATE sellers
+                SET student_id = $1, updated_at = CURRENT_TIMESTAMP
+                WHERE is_official = true
+                RETURNING *
+                `,
+                [student.id]
+            );
+
+            if (kuriosResult.rows.length === 0) {
+
+                return res.status(404).json({
+                    success: false,
+                    message: "Kurios Stores seller record not found."
+                });
+
+            }
+
+            res.status(200).json({
+
+                success: true,
+
+                message:
+                    "Kurios Stores is now linked to " +
+                    (student.first_name || student.email) +
+                    ". They can manage it from their own seller dashboard.",
+
+                seller: kuriosResult.rows[0]
+
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Link Kurios Stores error:",
+                error.message
+            );
+
+            res.status(500).json({
+                success: false,
+                message: "Could not link Kurios Stores to that account."
+            });
+
+        }
+
+    }
+);
 
 
 // ========================================
@@ -5269,7 +5746,8 @@ app.get("/api/store/:sellerId", async (req, res) => {
                 store_description,
                 business_category,
                 location,
-                seller_type
+                seller_type,
+                store_image
             FROM sellers
             WHERE id = $1
             AND status = 'approved'
