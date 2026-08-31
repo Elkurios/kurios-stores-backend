@@ -13,7 +13,6 @@ const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
-const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
@@ -162,36 +161,73 @@ const profilePictureUpload = multer({
 
 
 // ========================================
-// EMAIL CONFIGURATION
+// EMAIL CONFIGURATION (Resend HTTPS API)
 // ========================================
 
-const emailTransporter = nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true,
-    family: 4,
+/*
+    Render does not support outbound IPv6, and Gmail's
+    SMTP server resolves to an IPv6 address from Render's
+    network — so raw SMTP to Gmail fails with ENETUNREACH.
 
-    connectionTimeout: 30000,
-    greetingTimeout: 30000,
-    socketTimeout: 30000,
+    Resend sends email over a normal HTTPS API call instead
+    of a raw SMTP socket, which avoids that problem entirely.
 
-    tls: {
-        rejectUnauthorized: false
-    },
+    Put this in your Render Environment Variables:
 
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASSWORD
+    RESEND_API_KEY=...
+    EMAIL_FROM=Kurios Stores <onboarding@resend.dev>
+
+    (Once you verify your own domain on Resend, change
+    EMAIL_FROM to something like
+    "Kurios Stores <no-reply@kuriosstores.com>".)
+*/
+
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const EMAIL_FROM =
+    process.env.EMAIL_FROM ||
+    "Kurios Stores <onboarding@resend.dev>";
+
+async function sendEmail({ to, subject, html }) {
+
+    const response = await fetch(
+        "https://api.resend.com/emails",
+        {
+            method: "POST",
+            headers: {
+                "Authorization": "Bearer " + RESEND_API_KEY,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                from: EMAIL_FROM,
+                to: [to],
+                subject: subject,
+                html: html
+            })
+        }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+
+        throw new Error(
+            "Resend error: " +
+            (data.message || JSON.stringify(data))
+        );
+
     }
-});
 
-emailTransporter.verify()
-    .then(() => {
-        console.log("Email server is ready.");
-    })
-    .catch((error) => {
-        console.error("Email configuration error:", error.message);
-    });
+    return data;
+
+}
+
+if (!RESEND_API_KEY) {
+    console.error(
+        "Email configuration error: RESEND_API_KEY is not set."
+    );
+} else {
+    console.log("Email is configured via Resend.");
+}
 
 // ========================================
 // MIDDLEWARE
@@ -780,10 +816,7 @@ if (emailCheck.rows.length > 0) {
     // SEND NEW VERIFICATION EMAIL
     // ====================================
 
-    await emailTransporter.sendMail({
-
-        from:
-            `"Kurios Stores" <${process.env.EMAIL_USER}>`,
+    await sendEmail({
 
         to:
             updatedStudent.rows[0].email,
@@ -1054,9 +1087,7 @@ await pool.query(
 // SEND VERIFICATION EMAIL
 // ====================================
 
-await emailTransporter.sendMail({
-
-    from: `"Kurios Stores" <${process.env.EMAIL_USER}>`,
+await sendEmail({
 
     to: result.rows[0].email,
 
@@ -1509,10 +1540,7 @@ app.post("/api/students/resend-otp", async (req, res) => {
         // SEND NEW OTP EMAIL
         // ====================================
 
-        await emailTransporter.sendMail({
-
-            from:
-                `"Kurios Stores" <${process.env.EMAIL_USER}>`,
+        await sendEmail({
 
             to:
                 student.email,
