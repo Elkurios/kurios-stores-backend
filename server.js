@@ -402,6 +402,43 @@ const productImageUpload = multer({
 
 
 // ========================================
+// CSV IMPORT UPLOAD
+// (kept in memory — we only need to parse
+// it, not store the file itself)
+// ========================================
+
+const csvUpload = multer({
+
+    storage: multer.memoryStorage(),
+
+    limits: {
+        fileSize: 10 * 1024 * 1024 // 10MB max
+    },
+
+    fileFilter: function (req, file, cb) {
+
+        const allowedTypes = [
+            "text/csv",
+            "application/vnd.ms-excel",
+            "application/csv",
+            "text/plain"
+        ];
+
+        if (
+            allowedTypes.includes(file.mimetype) ||
+            file.originalname.toLowerCase().endsWith(".csv")
+        ) {
+            cb(null, true);
+        } else {
+            cb(new Error("Please upload a CSV file."));
+        }
+
+    }
+
+});
+
+
+// ========================================
 // EMAIL CONFIGURATION (Resend HTTPS API)
 // ========================================
 
@@ -1002,6 +1039,13 @@ async function ensureProductSellerColumnsExist() {
             `
             ALTER TABLE products
             ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE products
+            ADD COLUMN IF NOT EXISTS sku TEXT
             `
         );
 
@@ -5269,6 +5313,446 @@ app.post(
             res.status(500).json({
                 success: false,
                 message: "Could not link Kurios Stores to that account."
+            });
+
+        }
+
+    }
+);
+
+
+// ========================================
+// PARSE A CSV FILE INTO ROW OBJECTS
+// (handles quoted fields, commas inside
+// quotes, and "" as an escaped quote)
+// ========================================
+
+function parseCsv(text) {
+
+    const rows = [];
+    let row = [];
+    let field = "";
+    let inQuotes = false;
+
+    // Normalise line endings first.
+
+    const cleanText =
+        text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+    for (let i = 0; i < cleanText.length; i++) {
+
+        const char = cleanText[i];
+
+        if (inQuotes) {
+
+            if (char === '"') {
+
+                if (cleanText[i + 1] === '"') {
+                    field += '"';
+                    i++;
+                } else {
+                    inQuotes = false;
+                }
+
+            } else {
+
+                field += char;
+
+            }
+
+        } else {
+
+            if (char === '"') {
+
+                inQuotes = true;
+
+            } else if (char === ",") {
+
+                row.push(field);
+                field = "";
+
+            } else if (char === "\n") {
+
+                row.push(field);
+                rows.push(row);
+                row = [];
+                field = "";
+
+            } else {
+
+                field += char;
+
+            }
+
+        }
+
+    }
+
+    // Last field/row, if the file doesn't
+    // end with a newline.
+
+    if (field.length > 0 || row.length > 0) {
+        row.push(field);
+        rows.push(row);
+    }
+
+    if (rows.length === 0) {
+        return [];
+    }
+
+    const headers =
+        rows[0].map(function (h) {
+            return h.trim();
+        });
+
+    const dataRows =
+        rows.slice(1).filter(function (r) {
+            return r.some(function (cell) {
+                return cell.trim() !== "";
+            });
+        });
+
+    return dataRows.map(function (cells) {
+
+        const obj = {};
+
+        headers.forEach(function (header, index) {
+            obj[header] = (cells[index] || "").trim();
+        });
+
+        return obj;
+
+    });
+
+}
+
+
+// ========================================
+// IMPORT PRODUCTS FROM A CSV FILE
+// (approved sellers only — works with plain
+// spreadsheets, and with multi-location POS
+// exports like Loyverse's, where you pick
+// which location's price/stock columns to use)
+// ========================================
+
+app.post(
+    "/api/sellers/products/import",
+    function (req, res, next) {
+
+        csvUpload.single("file")(
+            req,
+            res,
+            function (error) {
+
+                if (error) {
+
+                    return res.status(400).json({
+                        success: false,
+                        message: error.message
+                    });
+
+                }
+
+                next();
+
+            }
+        );
+
+    },
+    async (req, res) => {
+
+        try {
+
+            const { studentId, location } = req.body;
+
+            if (!studentId) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Missing studentId."
+                });
+
+            }
+
+            if (!req.file) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Please choose a CSV file."
+                });
+
+            }
+
+            const seller =
+                await getApprovedSeller(studentId);
+
+            if (!seller) {
+
+                return res.status(403).json({
+                    success: false,
+                    message: "Only approved sellers can import products."
+                });
+
+            }
+
+            const csvText =
+                req.file.buffer.toString("utf-8");
+
+            const rows =
+                parseCsv(csvText);
+
+            if (rows.length === 0) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "That CSV file appears to be empty."
+                });
+
+            }
+
+
+            // ====================================
+            // WORK OUT WHICH COLUMNS TO READ FROM,
+            // BASED ON THE CHOSEN LOCATION (IF ANY)
+            // ====================================
+
+            const suffix =
+                location ? " [" + location + "]" : "";
+
+            const nameKey = "Item Name";
+            const skuKey = "SKU";
+            const categoryKey = "Category";
+            const variationKey = "Variation Name";
+
+            const priceKey =
+                location ?
+                    "Fixed Sell Price" + suffix :
+                    "Fixed Sell Price";
+
+            const stockKey =
+                location ?
+                    "Stock" + suffix :
+                    "Stock";
+
+            const availableKey =
+                location ?
+                    "Available" + suffix :
+                    null;
+
+            let imported = 0;
+            let updated = 0;
+            let skipped = 0;
+
+            for (const row of rows) {
+
+                const itemName =
+                    (row[nameKey] || "").trim();
+
+                if (!itemName) {
+                    skipped++;
+                    continue;
+                }
+
+
+                // Skip rows explicitly marked as
+                // unavailable at the chosen location.
+
+                if (
+                    availableKey &&
+                    row[availableKey] &&
+                    row[availableKey].trim().toUpperCase() === "N"
+                ) {
+                    skipped++;
+                    continue;
+                }
+
+
+                // Price: prefer the location-specific
+                // column, fall back to the plain one.
+
+                let rawPrice =
+                    row[priceKey];
+
+                if (
+                    (!rawPrice || !rawPrice.trim()) &&
+                    location
+                ) {
+                    rawPrice = row["Fixed Sell Price"];
+                }
+
+                const price =
+                    parseFloat(
+                        (rawPrice || "").replace(/,/g, "")
+                    );
+
+                if (!price || price <= 0 || isNaN(price)) {
+                    skipped++;
+                    continue;
+                }
+
+
+                // Stock — defaults to 0 if not found.
+
+                const rawStock =
+                    row[stockKey];
+
+                const stock =
+                    rawStock && rawStock.trim() ?
+                        Math.max(0, Math.floor(parseFloat(rawStock))) :
+                        0;
+
+
+                // Category, SKU.
+
+                const category =
+                    (row[categoryKey] || "").trim() || null;
+
+                const sku =
+                    (row[skuKey] || "").trim() || null;
+
+
+                // Fold a meaningful variation name into
+                // the product name (skip generic "Regular"
+                // or a variation identical to the item name).
+
+                const variation =
+                    (row[variationKey] || "").trim();
+
+                const finalName =
+                    (
+                        variation &&
+                        variation.toLowerCase() !== "regular" &&
+                        variation.toLowerCase() !== itemName.toLowerCase()
+                    ) ?
+                        itemName + " (" + variation + ")" :
+                        itemName;
+
+
+                // ====================================
+                // UPSERT — MATCH BY SKU FIRST, THEN
+                // BY EXACT NAME WITHIN THIS SELLER
+                // ====================================
+
+                let existing = null;
+
+                if (sku) {
+
+                    const existingBySku = await pool.query(
+                        `
+                        SELECT id
+                        FROM products
+                        WHERE seller_id = $1
+                        AND sku = $2
+                        LIMIT 1
+                        `,
+                        [seller.id, sku]
+                    );
+
+                    existing = existingBySku.rows[0] || null;
+
+                }
+
+                if (!existing) {
+
+                    const existingByName = await pool.query(
+                        `
+                        SELECT id
+                        FROM products
+                        WHERE seller_id = $1
+                        AND LOWER(name) = LOWER($2)
+                        LIMIT 1
+                        `,
+                        [seller.id, finalName]
+                    );
+
+                    existing = existingByName.rows[0] || null;
+
+                }
+
+                if (existing) {
+
+                    await pool.query(
+                        `
+                        UPDATE products
+                        SET
+                            name = $1,
+                            category = $2,
+                            price = $3,
+                            stock_quantity = $4,
+                            sku = $5,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = $6
+                        `,
+                        [
+                            finalName,
+                            category,
+                            price,
+                            stock,
+                            sku,
+                            existing.id
+                        ]
+                    );
+
+                    updated++;
+
+                } else {
+
+                    await pool.query(
+                        `
+                        INSERT INTO products (
+                            name,
+                            category,
+                            price,
+                            stock_quantity,
+                            sku,
+                            seller_id
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        `,
+                        [
+                            finalName,
+                            category,
+                            price,
+                            stock,
+                            sku,
+                            seller.id
+                        ]
+                    );
+
+                    imported++;
+
+                }
+
+            }
+
+            res.status(200).json({
+
+                success: true,
+
+                message:
+                    "Import complete: " +
+                    imported + " added, " +
+                    updated + " updated, " +
+                    skipped + " skipped.",
+
+                imported: imported,
+
+                updated: updated,
+
+                skipped: skipped
+
+            });
+
+        } catch (error) {
+
+            console.error(
+                "CSV import error:",
+                error.message
+            );
+
+            res.status(500).json({
+                success: false,
+                message: "Something went wrong while importing your products."
             });
 
         }
