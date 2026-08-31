@@ -353,6 +353,54 @@ const profilePictureUpload = multer({
 });
 
 
+const productImageStorage = multer.diskStorage({
+
+    destination: function (req, file, cb) {
+        cb(null, uploadsFolder);
+    },
+
+    filename: function (req, file, cb) {
+
+        const uniqueSuffix =
+            Date.now() +
+            "-" +
+            crypto.randomInt(100000, 999999);
+
+        cb(
+            null,
+            "product-" +
+                uniqueSuffix +
+                path.extname(file.originalname)
+        );
+
+    }
+
+});
+
+const productImageUpload = multer({
+
+    storage: productImageStorage,
+
+    limits: {
+        fileSize: 5 * 1024 * 1024 // 5MB max
+    },
+
+    fileFilter: function (req, file, cb) {
+
+        const allowedTypes =
+            ["image/jpeg", "image/png", "image/webp"];
+
+        if (allowedTypes.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error("Only JPG, PNG, or WEBP images are allowed."));
+        }
+
+    }
+
+});
+
+
 // ========================================
 // EMAIL CONFIGURATION (Resend HTTPS API)
 // ========================================
@@ -927,6 +975,53 @@ async function ensureNotificationsTableExists() {
 
 
 // ========================================
+// PRODUCT SELLER COLUMNS
+// (let products belong to a seller, and
+// let sellers/admin hide a product)
+// ========================================
+
+async function ensureProductSellerColumnsExist() {
+
+    try {
+
+        await pool.query(
+            `
+            ALTER TABLE products
+            ADD COLUMN IF NOT EXISTS seller_id INTEGER REFERENCES sellers(id)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE products
+            ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE products
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+            `
+        );
+
+        console.log(
+            "Product seller columns are ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not add product seller columns:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
 // RUN ALL MIGRATIONS, IN ORDER
 // ========================================
 
@@ -949,6 +1044,7 @@ async function runMigrations() {
     await ensureAdminUsernameColumnExists();
     await seedInitialAdmin();
     await ensureNotificationsTableExists();
+    await ensureProductSellerColumnsExist();
 
 }
 
@@ -975,7 +1071,15 @@ app.get("/api/products", async (req, res) => {
     try {
 
         const result = await pool.query(
-            "SELECT * FROM products ORDER BY id ASC"
+            `
+            SELECT
+                products.*,
+                sellers.store_name AS seller_store_name
+            FROM products
+            LEFT JOIN sellers ON sellers.id = products.seller_id
+            WHERE products.is_active = true
+            ORDER BY products.id ASC
+            `
         );
 
         res.json(result.rows);
@@ -4671,6 +4775,613 @@ app.post(
     "/api/admin/students/:id/unsuspend",
     requireAdminAuth,
     (req, res) => setStudentSuspension(req, res, false)
+);
+
+
+// ========================================
+// SELLER PRODUCTS
+// ========================================
+
+async function getApprovedSeller(studentId) {
+
+    const result = await pool.query(
+        `
+        SELECT *
+        FROM sellers
+        WHERE student_id = $1
+        AND status = 'approved'
+        LIMIT 1
+        `,
+        [studentId]
+    );
+
+    return result.rows[0] || null;
+
+}
+
+
+// ========================================
+// ADD A PRODUCT (APPROVED SELLERS ONLY)
+// ========================================
+
+app.post(
+    "/api/sellers/products",
+    function (req, res, next) {
+
+        productImageUpload.single("image")(
+            req,
+            res,
+            function (error) {
+
+                if (error) {
+
+                    return res.status(400).json({
+                        success: false,
+                        message: error.message
+                    });
+
+                }
+
+                next();
+
+            }
+        );
+
+    },
+    async (req, res) => {
+
+        try {
+
+            const {
+                studentId,
+                name,
+                description,
+                price,
+                category,
+                stockQuantity
+            } = req.body;
+
+            if (!studentId || !name || !price) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Please provide at least a product name and price."
+                });
+
+            }
+
+            const seller =
+                await getApprovedSeller(studentId);
+
+            if (!seller) {
+
+                return res.status(403).json({
+                    success: false,
+                    message: "Only approved sellers can add products."
+                });
+
+            }
+
+            const imageUrl =
+                req.file ?
+                    "/uploads/" + req.file.filename :
+                    null;
+
+            const result = await pool.query(
+                `
+                INSERT INTO products (
+                    name,
+                    description,
+                    price,
+                    image_url,
+                    category,
+                    stock_quantity,
+                    seller_id
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING *
+                `,
+                [
+                    name.trim(),
+                    description ? description.trim() : null,
+                    price,
+                    imageUrl,
+                    category ? category.trim() : null,
+                    stockQuantity ? parseInt(stockQuantity, 10) : 0,
+                    seller.id
+                ]
+            );
+
+            res.status(201).json({
+                success: true,
+                message: "Product added.",
+                product: result.rows[0]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Add product error:",
+                error.message
+            );
+
+            res.status(500).json({
+                success: false,
+                message: "Something went wrong while adding your product."
+            });
+
+        }
+
+    }
+);
+
+
+// ========================================
+// LIST A SELLER'S OWN PRODUCTS
+// ========================================
+
+app.get("/api/sellers/products", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const seller =
+            await getApprovedSeller(studentId);
+
+        if (!seller) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only approved sellers can view their products."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT *
+            FROM products
+            WHERE seller_id = $1
+            ORDER BY created_at DESC
+            `,
+            [seller.id]
+        );
+
+        res.status(200).json({
+            success: true,
+            products: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "List seller products error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your products."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// EDIT A PRODUCT (OWNER ONLY)
+// ========================================
+
+app.post(
+    "/api/sellers/products/:id/update",
+    function (req, res, next) {
+
+        productImageUpload.single("image")(
+            req,
+            res,
+            function (error) {
+
+                if (error) {
+
+                    return res.status(400).json({
+                        success: false,
+                        message: error.message
+                    });
+
+                }
+
+                next();
+
+            }
+        );
+
+    },
+    async (req, res) => {
+
+        try {
+
+            const { id } = req.params;
+
+            const {
+                studentId,
+                name,
+                description,
+                price,
+                category,
+                stockQuantity,
+                isActive
+            } = req.body;
+
+            if (!studentId) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Missing studentId."
+                });
+
+            }
+
+            const seller =
+                await getApprovedSeller(studentId);
+
+            if (!seller) {
+
+                return res.status(403).json({
+                    success: false,
+                    message: "Only approved sellers can edit products."
+                });
+
+            }
+
+            const currentResult = await pool.query(
+                `SELECT * FROM products WHERE id = $1 LIMIT 1`,
+                [id]
+            );
+
+            if (currentResult.rows.length === 0) {
+
+                return res.status(404).json({
+                    success: false,
+                    message: "Product not found."
+                });
+
+            }
+
+            const currentProduct =
+                currentResult.rows[0];
+
+            if (currentProduct.seller_id !== seller.id) {
+
+                return res.status(403).json({
+                    success: false,
+                    message: "You don't own this product."
+                });
+
+            }
+
+            const newImageUrl =
+                req.file ?
+                    "/uploads/" + req.file.filename :
+                    currentProduct.image_url;
+
+            const updatedResult = await pool.query(
+                `
+                UPDATE products
+                SET
+                    name = $1,
+                    description = $2,
+                    price = $3,
+                    category = $4,
+                    stock_quantity = $5,
+                    image_url = $6,
+                    is_active = $7,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $8
+                RETURNING *
+                `,
+                [
+                    name ? name.trim() : currentProduct.name,
+                    description !== undefined ?
+                        (description ? description.trim() : null) :
+                        currentProduct.description,
+                    price ? price : currentProduct.price,
+                    category !== undefined ?
+                        (category ? category.trim() : null) :
+                        currentProduct.category,
+                    stockQuantity !== undefined ?
+                        parseInt(stockQuantity, 10) :
+                        currentProduct.stock_quantity,
+                    newImageUrl,
+                    isActive !== undefined ?
+                        (isActive === "true" || isActive === true) :
+                        currentProduct.is_active,
+                    id
+                ]
+            );
+
+
+            // Remove the old image file only once the
+            // new one is safely saved.
+
+            if (
+                req.file &&
+                currentProduct.image_url &&
+                currentProduct.image_url !== newImageUrl
+            ) {
+
+                const oldImagePath =
+                    path.join(
+                        uploadsFolder,
+                        path.basename(currentProduct.image_url)
+                    );
+
+                fs.unlink(oldImagePath, function () {});
+
+            }
+
+            res.status(200).json({
+                success: true,
+                message: "Product updated.",
+                product: updatedResult.rows[0]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Update product error:",
+                error.message
+            );
+
+            res.status(500).json({
+                success: false,
+                message: "Something went wrong while updating your product."
+            });
+
+        }
+
+    }
+);
+
+
+// ========================================
+// DELETE A PRODUCT (OWNER ONLY)
+// ========================================
+
+app.post("/api/sellers/products/:id/delete", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const seller =
+            await getApprovedSeller(studentId);
+
+        if (!seller) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only approved sellers can delete products."
+            });
+
+        }
+
+        const currentResult = await pool.query(
+            `SELECT * FROM products WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (currentResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Product not found."
+            });
+
+        }
+
+        const product =
+            currentResult.rows[0];
+
+        if (product.seller_id !== seller.id) {
+
+            return res.status(403).json({
+                success: false,
+                message: "You don't own this product."
+            });
+
+        }
+
+        await pool.query(
+            `DELETE FROM products WHERE id = $1`,
+            [id]
+        );
+
+        if (product.image_url) {
+
+            const imagePath =
+                path.join(
+                    uploadsFolder,
+                    path.basename(product.image_url)
+                );
+
+            fs.unlink(imagePath, function () {});
+
+        }
+
+        res.status(200).json({
+            success: true,
+            message: "Product deleted."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Delete product error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not delete this product."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// PUBLIC STOREFRONT
+// ========================================
+
+app.get("/api/store/:sellerId", async (req, res) => {
+
+    try {
+
+        const { sellerId } = req.params;
+
+        const sellerResult = await pool.query(
+            `
+            SELECT
+                id,
+                store_name,
+                store_description,
+                business_category,
+                location,
+                seller_type
+            FROM sellers
+            WHERE id = $1
+            AND status = 'approved'
+            LIMIT 1
+            `,
+            [sellerId]
+        );
+
+        if (sellerResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Store not found."
+            });
+
+        }
+
+        const productsResult = await pool.query(
+            `
+            SELECT *
+            FROM products
+            WHERE seller_id = $1
+            AND is_active = true
+            ORDER BY created_at DESC
+            `,
+            [sellerId]
+        );
+
+        res.status(200).json({
+            success: true,
+            store: sellerResult.rows[0],
+            products: productsResult.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch storefront error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load this store."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ADMIN — DEACTIVATE / REACTIVATE A PRODUCT
+// ========================================
+
+async function setProductActive(req, res, isActive) {
+
+    try {
+
+        const { id } = req.params;
+
+        const result = await pool.query(
+            `
+            UPDATE products
+            SET is_active = $1, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $2
+            RETURNING *
+            `,
+            [isActive, id]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Product not found."
+            });
+
+        }
+
+        res.status(200).json({
+            success: true,
+            message: isActive ? "Product reactivated." : "Product deactivated.",
+            product: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Admin product moderation error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not update this product."
+        });
+
+    }
+
+}
+
+app.post(
+    "/api/admin/products/:id/deactivate",
+    requireAdminAuth,
+    (req, res) => setProductActive(req, res, false)
+);
+
+app.post(
+    "/api/admin/products/:id/activate",
+    requireAdminAuth,
+    (req, res) => setProductActive(req, res, true)
 );
 
 
