@@ -2197,6 +2197,7 @@ app.post(
             const {
                 studentId,
                 phone,
+                whatsappNumber,
                 dateOfBirth
             } = req.body;
 
@@ -2221,7 +2222,12 @@ app.post(
                     null;
 
 
-            if (!phone && !dateOfBirth && !newProfilePicturePath) {
+            if (
+                !phone &&
+                !whatsappNumber &&
+                !dateOfBirth &&
+                !newProfilePicturePath
+            ) {
 
                 return res.status(400).json({
                     success: false,
@@ -2242,6 +2248,7 @@ app.post(
                 SELECT
                     id,
                     phone,
+                    whatsapp_number,
                     date_of_birth,
                     profile_picture
                 FROM students
@@ -2273,10 +2280,11 @@ app.post(
                 UPDATE students
                 SET
                     phone = $1,
-                    date_of_birth = $2,
-                    profile_picture = $3,
+                    whatsapp_number = $2,
+                    date_of_birth = $3,
+                    profile_picture = $4,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE id = $4
+                WHERE id = $5
                 RETURNING
                     id,
                     first_name,
@@ -2294,6 +2302,10 @@ app.post(
                     phone ?
                         phone.trim() :
                         currentStudent.phone,
+
+                    whatsappNumber ?
+                        whatsappNumber.trim() :
+                        currentStudent.whatsapp_number,
 
                     dateOfBirth ?
                         dateOfBirth :
