@@ -965,6 +965,13 @@ async function ensureSellerPaymentColumnsExist() {
             `
         );
 
+        await pool.query(
+            `
+            ALTER TABLE sellers
+            ADD COLUMN IF NOT EXISTS wallet_balance NUMERIC(12, 2) DEFAULT 0
+            `
+        );
+
         console.log(
             "Seller payment columns are ready."
         );
@@ -1205,6 +1212,48 @@ async function ensureMessagesTableExists() {
 
 
 // ========================================
+// WALLET TRANSACTIONS
+// (a ledger of every credit/debit to a
+// seller's wallet — right now only credits
+// from confirmed sales; withdrawals/payouts
+// are a separate future feature)
+// ========================================
+
+async function ensureWalletTransactionsTableExists() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS wallet_transactions (
+                id SERIAL PRIMARY KEY,
+                seller_id INTEGER REFERENCES sellers(id),
+                type TEXT NOT NULL,
+                amount NUMERIC(12, 2) NOT NULL,
+                description TEXT,
+                order_id INTEGER,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        console.log(
+            "Wallet transactions table is ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not create wallet transactions table:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
 // RUN ALL MIGRATIONS, IN ORDER
 // ========================================
 
@@ -1230,6 +1279,7 @@ async function runMigrations() {
     await ensureProductSellerColumnsExist();
     await seedKuriosStoresSeller();
     await ensureMessagesTableExists();
+    await ensureWalletTransactionsTableExists();
 
 }
 
@@ -3277,6 +3327,9 @@ async function buildTrustedOrderItems(items) {
 
 async function applyOrderPaymentResult(order, isPaid, isFailed, transactionReference, statusLabel) {
 
+    const wasAlreadyPaid =
+        order.status === "paid";
+
     const updatedResult = await pool.query(
         `
         UPDATE orders
@@ -3294,6 +3347,32 @@ async function applyOrderPaymentResult(order, isPaid, isFailed, transactionRefer
         ]
     );
 
+
+    // ====================================
+    // CREDIT SELLERS' WALLETS
+    // (only on the first confirmation of
+    // this order, never twice)
+    // ====================================
+
+    if (isPaid && !wasAlreadyPaid) {
+
+        try {
+
+            await creditSellersForOrder(
+                updatedResult.rows[0]
+            );
+
+        } catch (error) {
+
+            console.error(
+                "Wallet crediting error:",
+                error.message
+            );
+
+        }
+
+    }
+
     return {
         success: isPaid,
         message:
@@ -3302,6 +3381,110 @@ async function applyOrderPaymentResult(order, isPaid, isFailed, transactionRefer
                 "Payment status: " + statusLabel,
         order: updatedResult.rows[0]
     };
+
+}
+
+
+// ========================================
+// CREDIT EACH SELLER'S WALLET FOR THEIR
+// SHARE OF A NEWLY-PAID ORDER
+// ========================================
+
+async function creditSellersForOrder(order) {
+
+    let items = [];
+
+    try {
+
+        items =
+            typeof order.items === "string" ?
+                JSON.parse(order.items) :
+                order.items;
+
+    } catch (error) {
+
+        return;
+
+    }
+
+    if (!items || items.length === 0) {
+        return;
+    }
+
+    const productIds =
+        items.map(function (item) {
+            return item.id;
+        });
+
+    const productsResult = await pool.query(
+        `
+        SELECT id, seller_id
+        FROM products
+        WHERE id = ANY($1::int[])
+        AND seller_id IS NOT NULL
+        `,
+        [productIds]
+    );
+
+    const sellerIdByProductId = {};
+
+    productsResult.rows.forEach(function (row) {
+        sellerIdByProductId[row.id] = row.seller_id;
+    });
+
+
+    // Group this order's line items by seller.
+
+    const subtotalsBySeller = {};
+
+    items.forEach(function (item) {
+
+        const sellerId =
+            sellerIdByProductId[item.id];
+
+        if (!sellerId) {
+            return;
+        }
+
+        const lineTotal =
+            Number(item.price) * Number(item.quantity);
+
+        subtotalsBySeller[sellerId] =
+            (subtotalsBySeller[sellerId] || 0) + lineTotal;
+
+    });
+
+
+    for (const sellerId of Object.keys(subtotalsBySeller)) {
+
+        const amount =
+            subtotalsBySeller[sellerId];
+
+        await pool.query(
+            `
+            UPDATE sellers
+            SET wallet_balance = wallet_balance + $1
+            WHERE id = $2
+            `,
+            [amount, sellerId]
+        );
+
+        await pool.query(
+            `
+            INSERT INTO wallet_transactions (
+                seller_id, type, amount, description, order_id
+            )
+            VALUES ($1, 'credit', $2, $3, $4)
+            `,
+            [
+                sellerId,
+                amount,
+                "Sale from order #" + order.id,
+                order.id
+            ]
+        );
+
+    }
 
 }
 
@@ -5183,6 +5366,234 @@ async function getApprovedSeller(studentId) {
     return result.rows[0] || null;
 
 }
+
+
+// ========================================
+// SELLER SALES — ORDERS CONTAINING
+// THIS SELLER'S PRODUCTS
+// ========================================
+
+/*
+    Orders can mix products from several sellers
+    in one checkout, and the order's stored items
+    don't record who sold each one — so instead of
+    tagging that at order time, we cross-reference
+    the seller's current product IDs against each
+    paid order's item list here, and only return
+    the seller's own line items (plus their share
+    of that order's total).
+*/
+
+app.get("/api/sellers/orders", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const seller =
+            await getApprovedSeller(studentId);
+
+        if (!seller) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only approved sellers can view their sales."
+            });
+
+        }
+
+        const productsResult = await pool.query(
+            `SELECT id FROM products WHERE seller_id = $1`,
+            [seller.id]
+        );
+
+        const sellerProductIds =
+            new Set(
+                productsResult.rows.map(function (row) {
+                    return row.id;
+                })
+            );
+
+        if (sellerProductIds.size === 0) {
+
+            return res.status(200).json({
+                success: true,
+                orders: [],
+                totalRevenue: 0
+            });
+
+        }
+
+        const ordersResult = await pool.query(
+            `
+            SELECT
+                orders.id,
+                orders.payment_reference,
+                orders.items,
+                orders.created_at,
+                students.first_name,
+                students.last_name,
+                students.email AS buyer_email,
+                students.phone AS buyer_phone
+            FROM orders
+            JOIN students ON students.id = orders.student_id
+            WHERE orders.status = 'paid'
+            ORDER BY orders.created_at DESC
+            LIMIT 300
+            `
+        );
+
+        const sellerOrders = [];
+        let totalRevenue = 0;
+
+        ordersResult.rows.forEach(function (order) {
+
+            let items = [];
+
+            try {
+
+                items =
+                    typeof order.items === "string" ?
+                        JSON.parse(order.items) :
+                        order.items;
+
+            } catch (error) {
+
+                items = [];
+
+            }
+
+            const myItems =
+                items.filter(function (item) {
+                    return sellerProductIds.has(item.id);
+                });
+
+            if (myItems.length === 0) {
+                return;
+            }
+
+            const mySubtotal =
+                myItems.reduce(function (sum, item) {
+                    return sum + (Number(item.price) * item.quantity);
+                }, 0);
+
+            totalRevenue += mySubtotal;
+
+            const buyerName =
+                `${order.first_name || ""} ${order.last_name || ""}`.trim();
+
+            sellerOrders.push({
+                orderId: order.id,
+                paymentReference: order.payment_reference,
+                createdAt: order.created_at,
+                buyerName: buyerName || "Kurios Student",
+                buyerEmail: order.buyer_email,
+                buyerPhone: order.buyer_phone,
+                items: myItems,
+                subtotal: mySubtotal
+            });
+
+        });
+
+        res.status(200).json({
+            success: true,
+            orders: sellerOrders,
+            totalRevenue: totalRevenue
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Seller orders error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your sales."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// SELLER WALLET — BALANCE + TRANSACTIONS
+// ========================================
+
+app.get("/api/sellers/wallet", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const seller =
+            await getApprovedSeller(studentId);
+
+        if (!seller) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only approved sellers have a wallet."
+            });
+
+        }
+
+        const transactionsResult = await pool.query(
+            `
+            SELECT *
+            FROM wallet_transactions
+            WHERE seller_id = $1
+            ORDER BY created_at DESC
+            LIMIT 100
+            `,
+            [seller.id]
+        );
+
+        res.status(200).json({
+
+            success: true,
+
+            balance: Number(seller.wallet_balance || 0),
+
+            transactions: transactionsResult.rows
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch seller wallet error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your wallet."
+        });
+
+    }
+
+});
 
 
 // ========================================
