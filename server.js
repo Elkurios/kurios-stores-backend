@@ -3710,7 +3710,7 @@ app.post("/api/orders/pay/opay", async (req, res) => {
 
         res.status(500).json({
             success: false,
-            message: "Could not start OPay checkout."
+            message: error.message || "Could not start OPay checkout."
         });
 
     }
@@ -4489,7 +4489,7 @@ app.post("/api/sellers/apply/pay/opay", async (req, res) => {
 
         res.status(500).json({
             success: false,
-            message: "Could not start OPay checkout."
+            message: error.message || "Could not start OPay checkout."
         });
 
     }
