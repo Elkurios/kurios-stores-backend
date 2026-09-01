@@ -1254,6 +1254,49 @@ async function ensureWalletTransactionsTableExists() {
 
 
 // ========================================
+// PRODUCT REVIEWS
+// (only from students who actually bought
+// the product — checked at submit time, not
+// enforced by a foreign key, since "did they
+// buy it" is a computed fact, not a stored one)
+// ========================================
+
+async function ensureReviewsTableExists() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS reviews (
+                id SERIAL PRIMARY KEY,
+                product_id INTEGER REFERENCES products(id),
+                student_id INTEGER REFERENCES students(id),
+                order_id INTEGER,
+                rating INTEGER NOT NULL,
+                comment TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (product_id, student_id)
+            )
+            `
+        );
+
+        console.log(
+            "Reviews table is ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not create reviews table:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
 // RUN ALL MIGRATIONS, IN ORDER
 // ========================================
 
@@ -1280,6 +1323,7 @@ async function runMigrations() {
     await seedKuriosStoresSeller();
     await ensureMessagesTableExists();
     await ensureWalletTransactionsTableExists();
+    await ensureReviewsTableExists();
 
 }
 
@@ -1309,9 +1353,19 @@ app.get("/api/products", async (req, res) => {
             `
             SELECT
                 products.*,
-                sellers.store_name AS seller_store_name
+                sellers.store_name AS seller_store_name,
+                COALESCE(review_stats.avg_rating, 0) AS avg_rating,
+                COALESCE(review_stats.review_count, 0) AS review_count
             FROM products
             LEFT JOIN sellers ON sellers.id = products.seller_id
+            LEFT JOIN (
+                SELECT
+                    product_id,
+                    ROUND(AVG(rating)::numeric, 1) AS avg_rating,
+                    COUNT(*) AS review_count
+                FROM reviews
+                GROUP BY product_id
+            ) AS review_stats ON review_stats.product_id = products.id
             WHERE products.is_active = true
             ORDER BY products.id ASC
             `
@@ -5746,6 +5800,40 @@ app.get("/api/sellers/dashboard-stats", async (req, res) => {
 
 
         // ====================================
+        // STORE RATING (real, from reviews on
+        // this seller's own products — 0 if none)
+        // ====================================
+
+        let storeRating = 0;
+        let storeReviewCount = 0;
+
+        if (sellerProductIds.size > 0) {
+
+            const ratingResult = await pool.query(
+                `
+                SELECT rating
+                FROM reviews
+                WHERE product_id = ANY($1::int[])
+                `,
+                [Array.from(sellerProductIds)]
+            );
+
+            storeReviewCount = ratingResult.rows.length;
+
+            if (storeReviewCount > 0) {
+
+                storeRating =
+                    Math.round(
+                        (ratingResult.rows.reduce(function (sum, r) { return sum + r.rating; }, 0) /
+                            storeReviewCount) * 10
+                    ) / 10;
+
+            }
+
+        }
+
+
+        // ====================================
         // SALES BY DAY (LAST 7 DAYS)
         // ====================================
 
@@ -5855,6 +5943,10 @@ app.get("/api/sellers/dashboard-stats", async (req, res) => {
             uniqueCustomers: uniqueCustomers,
 
             walletBalance: Number(seller.wallet_balance || 0),
+
+            storeRating: storeRating,
+
+            storeReviewCount: storeReviewCount,
 
             salesByDay: salesByDay,
 
@@ -7194,11 +7286,22 @@ app.get("/api/store/:sellerId", async (req, res) => {
 
         const productsResult = await pool.query(
             `
-            SELECT *
+            SELECT
+                products.*,
+                COALESCE(review_stats.avg_rating, 0) AS avg_rating,
+                COALESCE(review_stats.review_count, 0) AS review_count
             FROM products
-            WHERE seller_id = $1
-            AND is_active = true
-            ORDER BY created_at DESC
+            LEFT JOIN (
+                SELECT
+                    product_id,
+                    ROUND(AVG(rating)::numeric, 1) AS avg_rating,
+                    COUNT(*) AS review_count
+                FROM reviews
+                GROUP BY product_id
+            ) AS review_stats ON review_stats.product_id = products.id
+            WHERE products.seller_id = $1
+            AND products.is_active = true
+            ORDER BY products.created_at DESC
             `,
             [sellerId]
         );
@@ -7557,6 +7660,303 @@ app.post("/api/chat/messages", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Could not send your message."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// SUBMIT A PRODUCT REVIEW
+// (only students who actually bought and
+// paid for the product)
+// ========================================
+
+app.post("/api/products/:id/reviews", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+
+        const { studentId, rating, comment } = req.body;
+
+        if (!studentId || !rating) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please provide a rating."
+            });
+
+        }
+
+        const numericRating =
+            parseInt(rating, 10);
+
+        if (numericRating < 1 || numericRating > 5) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Rating must be between 1 and 5."
+            });
+
+        }
+
+
+        // ====================================
+        // CONFIRM THIS STUDENT ACTUALLY BOUGHT
+        // THIS PRODUCT (a paid order containing it)
+        // ====================================
+
+        const ordersResult = await pool.query(
+            `
+            SELECT id, items
+            FROM orders
+            WHERE student_id = $1
+            AND status = 'paid'
+            `,
+            [studentId]
+        );
+
+        let matchedOrderId = null;
+
+        for (const order of ordersResult.rows) {
+
+            let items = [];
+
+            try {
+
+                items =
+                    typeof order.items === "string" ?
+                        JSON.parse(order.items) :
+                        order.items;
+
+            } catch (error) {
+
+                items = [];
+
+            }
+
+            const hasProduct =
+                items.some(function (item) {
+                    return String(item.id) === String(id);
+                });
+
+            if (hasProduct) {
+
+                matchedOrderId = order.id;
+                break;
+
+            }
+
+        }
+
+        if (!matchedOrderId) {
+
+            return res.status(403).json({
+                success: false,
+                message: "You can only review products you've purchased."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            INSERT INTO reviews (product_id, student_id, order_id, rating, comment)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (product_id, student_id)
+            DO UPDATE SET rating = $4, comment = $5
+            RETURNING *
+            `,
+            [id, studentId, matchedOrderId, numericRating, comment ? comment.trim() : null]
+        );
+
+        res.status(201).json({
+
+            success: true,
+
+            message: "Thanks for your review.",
+
+            review: result.rows[0]
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Submit review error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not submit your review."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// GET REVIEWS FOR A PRODUCT
+// ========================================
+
+app.get("/api/products/:id/reviews", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+
+        const reviewsResult = await pool.query(
+            `
+            SELECT
+                reviews.rating,
+                reviews.comment,
+                reviews.created_at,
+                students.first_name
+            FROM reviews
+            JOIN students ON students.id = reviews.student_id
+            WHERE reviews.product_id = $1
+            ORDER BY reviews.created_at DESC
+            `,
+            [id]
+        );
+
+        const average =
+            reviewsResult.rows.length > 0 ?
+                reviewsResult.rows.reduce(function (sum, r) { return sum + r.rating; }, 0) /
+                    reviewsResult.rows.length :
+                0;
+
+        res.status(200).json({
+
+            success: true,
+
+            averageRating: Math.round(average * 10) / 10,
+
+            reviewCount: reviewsResult.rows.length,
+
+            reviews: reviewsResult.rows
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch reviews error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load reviews."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// PRODUCTS A STUDENT CAN REVIEW
+// (bought, paid, not yet reviewed)
+// ========================================
+
+app.get("/api/students/reviewable-products", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const ordersResult = await pool.query(
+            `SELECT id, items, created_at FROM orders WHERE student_id = $1 AND status = 'paid'`,
+            [studentId]
+        );
+
+        const reviewedResult = await pool.query(
+            `SELECT product_id FROM reviews WHERE student_id = $1`,
+            [studentId]
+        );
+
+        const reviewedIds =
+            new Set(
+                reviewedResult.rows.map(function (r) { return String(r.product_id); })
+            );
+
+        const seenIds = new Set();
+        const productIds = [];
+
+        ordersResult.rows.forEach(function (order) {
+
+            let items = [];
+
+            try {
+
+                items =
+                    typeof order.items === "string" ?
+                        JSON.parse(order.items) :
+                        order.items;
+
+            } catch (error) {
+
+                items = [];
+
+            }
+
+            items.forEach(function (item) {
+
+                const key = String(item.id);
+
+                if (!reviewedIds.has(key) && !seenIds.has(key)) {
+
+                    seenIds.add(key);
+                    productIds.push(item.id);
+
+                }
+
+            });
+
+        });
+
+        if (productIds.length === 0) {
+
+            return res.status(200).json({
+                success: true,
+                products: []
+            });
+
+        }
+
+        const productsResult = await pool.query(
+            `SELECT id, name, image_url FROM products WHERE id = ANY($1::int[])`,
+            [productIds]
+        );
+
+        res.status(200).json({
+            success: true,
+            products: productsResult.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch reviewable products error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load reviewable products."
         });
 
     }
