@@ -3440,11 +3440,15 @@ app.post("/api/orders/initiate", async (req, res) => {
         }
 
 
-        if (totalAmount <= 0) {
+        if (
+            !totalAmount ||
+            isNaN(totalAmount) ||
+            totalAmount <= 0
+        ) {
 
             return res.status(400).json({
                 success: false,
-                message: "Order total must be greater than zero."
+                message: "Order total must be greater than zero. Please check the prices on items in your cart."
             });
 
         }
