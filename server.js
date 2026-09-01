@@ -1161,6 +1161,43 @@ async function seedKuriosStoresSeller() {
 
 
 // ========================================
+// MESSAGES TABLE (student-to-student chat)
+// ========================================
+
+async function ensureMessagesTableExists() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                sender_id INTEGER REFERENCES students(id),
+                recipient_id INTEGER REFERENCES students(id),
+                body TEXT NOT NULL,
+                read_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        console.log(
+            "Messages table is ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not create messages table:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
 // RUN ALL MIGRATIONS, IN ORDER
 // ========================================
 
@@ -1185,6 +1222,7 @@ async function runMigrations() {
     await ensureNotificationsTableExists();
     await ensureProductSellerColumnsExist();
     await seedKuriosStoresSeller();
+    await ensureMessagesTableExists();
 
 }
 
@@ -6345,6 +6383,280 @@ app.post(
     requireAdminAuth,
     (req, res) => setProductActive(req, res, true)
 );
+
+
+// ========================================
+// CHAT — FIND A STUDENT BY PHONE NUMBER
+// ========================================
+
+app.post("/api/chat/find", async (req, res) => {
+
+    try {
+
+        const { studentId, phoneNumber } = req.body;
+
+        if (!studentId || !phoneNumber) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a phone number."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT id, first_name, last_name, profile_picture
+            FROM students
+            WHERE
+                RIGHT(regexp_replace(phone, '\\D', '', 'g'), 10) =
+                RIGHT(regexp_replace($1, '\\D', '', 'g'), 10)
+            AND id != $2
+            LIMIT 1
+            `,
+            [phoneNumber, studentId]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "No Kurios Stores student found with that phone number."
+            });
+
+        }
+
+        res.status(200).json({
+            success: true,
+            student: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Chat find student error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not look up that phone number."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CHAT — LIST MY CONVERSATIONS
+// ========================================
+
+app.get("/api/chat/conversations", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT
+                partner.id,
+                partner.first_name,
+                partner.last_name,
+                partner.profile_picture,
+                latest.body AS last_message,
+                latest.created_at AS last_message_at,
+                latest.sender_id AS last_message_sender_id,
+                (
+                    SELECT COUNT(*)::int
+                    FROM messages
+                    WHERE recipient_id = $1
+                    AND sender_id = partner.id
+                    AND read_at IS NULL
+                ) AS unread_count
+            FROM (
+                SELECT DISTINCT
+                    CASE
+                        WHEN sender_id = $1 THEN recipient_id
+                        ELSE sender_id
+                    END AS partner_id
+                FROM messages
+                WHERE sender_id = $1 OR recipient_id = $1
+            ) AS partners
+            JOIN students AS partner ON partner.id = partners.partner_id
+            JOIN LATERAL (
+                SELECT body, created_at, sender_id
+                FROM messages
+                WHERE
+                    (sender_id = $1 AND recipient_id = partner.id)
+                    OR (sender_id = partner.id AND recipient_id = $1)
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) AS latest ON true
+            ORDER BY latest.created_at DESC
+            `,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            conversations: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "List conversations error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your conversations."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CHAT — GET A MESSAGE THREAD
+// (also marks incoming messages as read)
+// ========================================
+
+app.get("/api/chat/messages", async (req, res) => {
+
+    try {
+
+        const { studentId, withId } = req.query;
+
+        if (!studentId || !withId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId or withId."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT *
+            FROM messages
+            WHERE
+                (sender_id = $1 AND recipient_id = $2)
+                OR (sender_id = $2 AND recipient_id = $1)
+            ORDER BY created_at ASC
+            `,
+            [studentId, withId]
+        );
+
+        await pool.query(
+            `
+            UPDATE messages
+            SET read_at = CURRENT_TIMESTAMP
+            WHERE recipient_id = $1
+            AND sender_id = $2
+            AND read_at IS NULL
+            `,
+            [studentId, withId]
+        );
+
+        res.status(200).json({
+            success: true,
+            messages: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch message thread error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load this conversation."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CHAT — SEND A MESSAGE
+// ========================================
+
+app.post("/api/chat/messages", async (req, res) => {
+
+    try {
+
+        const { senderId, recipientId, body } = req.body;
+
+        if (!senderId || !recipientId || !body || !body.trim()) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Message cannot be empty."
+            });
+
+        }
+
+        const recipientCheck = await pool.query(
+            `SELECT id FROM students WHERE id = $1 LIMIT 1`,
+            [recipientId]
+        );
+
+        if (recipientCheck.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "That student could not be found."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            INSERT INTO messages (sender_id, recipient_id, body)
+            VALUES ($1, $2, $3)
+            RETURNING *
+            `,
+            [senderId, recipientId, body.trim()]
+        );
+
+        res.status(201).json({
+            success: true,
+            message: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Send message error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not send your message."
+        });
+
+    }
+
+});
 
 
 // ========================================
