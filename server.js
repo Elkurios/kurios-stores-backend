@@ -5597,6 +5597,293 @@ app.get("/api/sellers/wallet", async (req, res) => {
 
 
 // ========================================
+// SELLER DASHBOARD STATS
+// (real numbers only — sales totals, order
+// counts, top products, a 7-day sales trend,
+// and order status breakdown, all computed
+// from actual paid orders. No fabricated
+// metrics like "conversion rate" or "store
+// rating" — we don't track those.)
+// ========================================
+
+app.get("/api/sellers/dashboard-stats", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const seller =
+            await getApprovedSeller(studentId);
+
+        if (!seller) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only approved sellers can view dashboard stats."
+            });
+
+        }
+
+
+        // ====================================
+        // PRODUCT COUNT
+        // ====================================
+
+        const productsResult = await pool.query(
+            `SELECT id, name FROM products WHERE seller_id = $1`,
+            [seller.id]
+        );
+
+        const sellerProducts = productsResult.rows;
+
+        const productNameById = {};
+
+        sellerProducts.forEach(function (p) {
+            productNameById[p.id] = p.name;
+        });
+
+        const sellerProductIds =
+            new Set(sellerProducts.map(function (p) { return p.id; }));
+
+
+        // ====================================
+        // ALL ORDERS TOUCHING THIS SELLER
+        // (any status, so we can show a real
+        // status breakdown too)
+        // ====================================
+
+        let sellerTouches = [];
+
+        if (sellerProductIds.size > 0) {
+
+            const ordersResult = await pool.query(
+                `
+                SELECT
+                    orders.id,
+                    orders.status,
+                    orders.items,
+                    orders.created_at,
+                    orders.student_id,
+                    students.first_name,
+                    students.last_name
+                FROM orders
+                JOIN students ON students.id = orders.student_id
+                ORDER BY orders.created_at DESC
+                LIMIT 500
+                `
+            );
+
+            ordersResult.rows.forEach(function (order) {
+
+                let items = [];
+
+                try {
+
+                    items =
+                        typeof order.items === "string" ?
+                            JSON.parse(order.items) :
+                            order.items;
+
+                } catch (error) {
+
+                    items = [];
+
+                }
+
+                const myItems =
+                    items.filter(function (item) {
+                        return sellerProductIds.has(item.id);
+                    });
+
+                if (myItems.length === 0) {
+                    return;
+                }
+
+                const subtotal =
+                    myItems.reduce(function (sum, item) {
+                        return sum + (Number(item.price) * item.quantity);
+                    }, 0);
+
+                sellerTouches.push({
+                    orderId: order.id,
+                    status: order.status,
+                    items: myItems,
+                    subtotal: subtotal,
+                    createdAt: order.created_at,
+                    buyerName:
+                        `${order.first_name || ""} ${order.last_name || ""}`.trim() ||
+                        "Kurios Student"
+                });
+
+            });
+
+        }
+
+        const paidTouches =
+            sellerTouches.filter(function (t) { return t.status === "paid"; });
+
+
+        // ====================================
+        // TOTAL SALES + UNIQUE CUSTOMERS
+        // ====================================
+
+        const totalSales =
+            paidTouches.reduce(function (sum, t) { return sum + t.subtotal; }, 0);
+
+        const uniqueCustomers =
+            new Set(
+                paidTouches.map(function (t) { return t.buyerName; })
+            ).size;
+
+
+        // ====================================
+        // SALES BY DAY (LAST 7 DAYS)
+        // ====================================
+
+        const salesByDay = [];
+
+        for (let i = 6; i >= 0; i--) {
+
+            const day = new Date();
+            day.setDate(day.getDate() - i);
+            day.setHours(0, 0, 0, 0);
+
+            const nextDay = new Date(day);
+            nextDay.setDate(nextDay.getDate() + 1);
+
+            const dayTotal =
+                paidTouches
+                    .filter(function (t) {
+
+                        const created = new Date(t.createdAt);
+                        return created >= day && created < nextDay;
+
+                    })
+                    .reduce(function (sum, t) { return sum + t.subtotal; }, 0);
+
+            salesByDay.push({
+
+                label: day.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
+
+                total: dayTotal
+
+            });
+
+        }
+
+
+        // ====================================
+        // TOP SELLING PRODUCTS
+        // ====================================
+
+        const qtyByProduct = {};
+
+        paidTouches.forEach(function (t) {
+
+            t.items.forEach(function (item) {
+
+                qtyByProduct[item.id] =
+                    (qtyByProduct[item.id] || 0) + Number(item.quantity);
+
+            });
+
+        });
+
+        const topProducts =
+            Object.keys(qtyByProduct)
+                .map(function (productId) {
+
+                    return {
+                        id: productId,
+                        name: productNameById[productId] || "Product",
+                        quantitySold: qtyByProduct[productId]
+                    };
+
+                })
+                .sort(function (a, b) {
+                    return b.quantitySold - a.quantitySold;
+                })
+                .slice(0, 5);
+
+
+        // ====================================
+        // ORDER STATUS BREAKDOWN
+        // ====================================
+
+        const statusBreakdown = {
+            paid: 0,
+            pending: 0,
+            failed: 0
+        };
+
+        sellerTouches.forEach(function (t) {
+
+            if (statusBreakdown[t.status] !== undefined) {
+                statusBreakdown[t.status]++;
+            }
+
+        });
+
+
+        // ====================================
+        // RECENT ORDERS (LAST 5)
+        // ====================================
+
+        const recentOrders =
+            sellerTouches.slice(0, 5);
+
+
+        res.status(200).json({
+
+            success: true,
+
+            totalSales: totalSales,
+
+            orderCount: paidTouches.length,
+
+            productCount: sellerProducts.length,
+
+            uniqueCustomers: uniqueCustomers,
+
+            walletBalance: Number(seller.wallet_balance || 0),
+
+            salesByDay: salesByDay,
+
+            topProducts: topProducts,
+
+            statusBreakdown: statusBreakdown,
+
+            recentOrders: recentOrders
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Seller dashboard stats error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your dashboard."
+        });
+
+    }
+
+});
+
+
+// ========================================
 // UPLOAD YOUR OWN STORE LOGO
 // (approved sellers only)
 // ========================================
