@@ -5693,7 +5693,7 @@ app.get("/api/sellers/dashboard-stats", async (req, res) => {
         // ====================================
 
         const productsResult = await pool.query(
-            `SELECT id, name FROM products WHERE seller_id = $1`,
+            `SELECT id, name, price, image_url FROM products WHERE seller_id = $1`,
             [seller.id]
         );
 
@@ -5890,9 +5890,16 @@ app.get("/api/sellers/dashboard-stats", async (req, res) => {
             Object.keys(qtyByProduct)
                 .map(function (productId) {
 
+                    const product =
+                        sellerProducts.find(function (p) {
+                            return String(p.id) === String(productId);
+                        });
+
                     return {
                         id: productId,
-                        name: productNameById[productId] || "Product",
+                        name: product ? product.name : "Product",
+                        price: product ? Number(product.price || 0) : 0,
+                        image_url: product ? product.image_url : null,
                         quantitySold: qtyByProduct[productId]
                     };
 
