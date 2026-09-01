@@ -705,6 +705,13 @@ async function ensureOrdersTableExists() {
             "Orders table is ready."
         );
 
+        await pool.query(
+            `
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS payment_gateway TEXT
+            `
+        );
+
     } catch (error) {
 
         console.error(
@@ -3268,6 +3275,37 @@ async function buildTrustedOrderItems(items) {
     after checkout" call and the webhook.
 */
 
+async function applyOrderPaymentResult(order, isPaid, isFailed, transactionReference, statusLabel) {
+
+    const updatedResult = await pool.query(
+        `
+        UPDATE orders
+        SET
+            status = $1,
+            transaction_reference = $2,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $3
+        RETURNING *
+        `,
+        [
+            isPaid ? "paid" : (isFailed ? "failed" : "pending"),
+            transactionReference,
+            order.id
+        ]
+    );
+
+    return {
+        success: isPaid,
+        message:
+            isPaid ?
+                "Payment confirmed." :
+                "Payment status: " + statusLabel,
+        order: updatedResult.rows[0]
+    };
+
+}
+
+
 async function verifyAndUpdateOrder(paymentReference) {
 
     const orderResult = await pool.query(
@@ -3294,7 +3332,7 @@ async function verifyAndUpdateOrder(paymentReference) {
         orderResult.rows[0];
 
 
-    // Already confirmed earlier — no need to ask Monnify again.
+    // Already confirmed earlier — no need to ask again.
 
     if (order.status === "paid") {
 
@@ -3306,6 +3344,53 @@ async function verifyAndUpdateOrder(paymentReference) {
 
     }
 
+
+    // ========================================
+    // OPAY
+    // ========================================
+
+    if (order.payment_gateway === "opay") {
+
+        let opayData;
+
+        try {
+
+            opayData =
+                await queryOpayPaymentStatus(paymentReference);
+
+        } catch (error) {
+
+            return {
+                success: false,
+                message: "Could not verify this payment with OPay.",
+                order: order
+            };
+
+        }
+
+        const isPaid =
+            opayData.status === "SUCCESS" &&
+            Number(opayData.amount.total) >=
+                Math.round(Number(order.amount) * 100);
+
+        const isFailed =
+            opayData.status === "FAIL" ||
+            opayData.status === "CLOSE";
+
+        return await applyOrderPaymentResult(
+            order,
+            isPaid,
+            isFailed,
+            opayData.orderNo,
+            opayData.status
+        );
+
+    }
+
+
+    // ========================================
+    // MONNIFY (default)
+    // ========================================
 
     const accessToken =
         await getMonnifyAccessToken();
@@ -3354,38 +3439,13 @@ async function verifyAndUpdateOrder(paymentReference) {
         paymentStatus === "EXPIRED" ||
         paymentStatus === "REVERSED";
 
-    const newStatus =
-        isPaid ?
-            "paid" :
-            isFailed ?
-                "failed" :
-                "pending";
-
-    const updatedResult = await pool.query(
-        `
-        UPDATE orders
-        SET
-            status = $1,
-            transaction_reference = $2,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = $3
-        RETURNING *
-        `,
-        [
-            newStatus,
-            transactionReference,
-            order.id
-        ]
+    return await applyOrderPaymentResult(
+        order,
+        isPaid,
+        isFailed,
+        transactionReference,
+        paymentStatus
     );
-
-    return {
-        success: isPaid,
-        message:
-            isPaid ?
-                "Payment confirmed." :
-                "Payment status: " + paymentStatus,
-        order: updatedResult.rows[0]
-    };
 
 }
 
@@ -3488,10 +3548,6 @@ app.post("/api/orders/initiate", async (req, res) => {
 
             amount: totalAmount,
 
-            apiKey: MONNIFY_API_KEY,
-
-            contractCode: MONNIFY_CONTRACT_CODE,
-
             customerName: customerName || "Kurios Student",
 
             customerEmail: customerEmail || ""
@@ -3508,6 +3564,153 @@ app.post("/api/orders/initiate", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Something went wrong while starting your order."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// GET MONNIFY CHECKOUT DETAILS FOR AN ORDER
+// ========================================
+
+app.post("/api/orders/pay/monnify", async (req, res) => {
+
+    try {
+
+        const { paymentReference } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const orderResult = await pool.query(
+            `SELECT * FROM orders WHERE payment_reference = $1 LIMIT 1`,
+            [paymentReference]
+        );
+
+        if (orderResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Order not found."
+            });
+
+        }
+
+        const order = orderResult.rows[0];
+
+        await pool.query(
+            `UPDATE orders SET payment_gateway = 'monnify' WHERE id = $1`,
+            [order.id]
+        );
+
+        res.status(200).json({
+
+            success: true,
+
+            paymentReference: paymentReference,
+
+            amount: Number(order.amount),
+
+            apiKey: MONNIFY_API_KEY,
+
+            contractCode: MONNIFY_CONTRACT_CODE
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Order Monnify checkout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not start Monnify checkout."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// GET OPAY CHECKOUT DETAILS FOR AN ORDER
+// ========================================
+
+app.post("/api/orders/pay/opay", async (req, res) => {
+
+    try {
+
+        const { paymentReference, returnUrl, customerName, customerEmail } = req.body;
+
+        if (!paymentReference || !returnUrl) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference or return URL."
+            });
+
+        }
+
+        const orderResult = await pool.query(
+            `SELECT * FROM orders WHERE payment_reference = $1 LIMIT 1`,
+            [paymentReference]
+        );
+
+        if (orderResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Order not found."
+            });
+
+        }
+
+        const order = orderResult.rows[0];
+
+        const opayData =
+            await createOpayCashierPayment({
+                reference: paymentReference,
+                amountNaira: Number(order.amount),
+                customerName: customerName || "Kurios Student",
+                customerEmail: customerEmail || "",
+                description: "Kurios Stores order",
+                returnUrl: returnUrl,
+                callbackUrl: OPAY_CALLBACK_URL
+            });
+
+        await pool.query(
+            `UPDATE orders SET payment_gateway = 'opay' WHERE id = $1`,
+            [order.id]
+        );
+
+        res.status(200).json({
+
+            success: true,
+
+            cashierUrl: opayData.cashierUrl
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Order OPay checkout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not start OPay checkout."
         });
 
     }
