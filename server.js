@@ -1372,6 +1372,33 @@ async function ensureConversationsSchemaExists() {
             `
         );
 
+        await pool.query(
+            `
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS message_reactions (
+                id SERIAL PRIMARY KEY,
+                message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+                student_id INTEGER REFERENCES students(id),
+                emoji TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (message_id, student_id)
+            )
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE INDEX IF NOT EXISTS idx_message_reactions_message_id
+            ON message_reactions (message_id)
+            `
+        );
+
 
         // ====================================
         // BACKFILL — every existing 1:1 message
@@ -7913,9 +7940,54 @@ app.get("/api/chat/messages", async (req, res) => {
             [studentId, withId]
         );
 
+        const messageIds =
+            result.rows.map(function (m) { return m.id; });
+
+        let reactionsByMessage = {};
+
+        if (messageIds.length > 0) {
+
+            const reactionsResult = await pool.query(
+                `
+                SELECT message_id, emoji, student_id
+                FROM message_reactions
+                WHERE message_id = ANY($1)
+                `,
+                [messageIds]
+            );
+
+            reactionsResult.rows.forEach(function (r) {
+
+                if (!reactionsByMessage[r.message_id]) {
+                    reactionsByMessage[r.message_id] = {};
+                }
+
+                if (!reactionsByMessage[r.message_id][r.emoji]) {
+                    reactionsByMessage[r.message_id][r.emoji] = { emoji: r.emoji, count: 0, reactedByMe: false };
+                }
+
+                reactionsByMessage[r.message_id][r.emoji].count += 1;
+
+                if (String(r.student_id) === String(studentId)) {
+                    reactionsByMessage[r.message_id][r.emoji].reactedByMe = true;
+                }
+
+            });
+
+        }
+
+        const messagesWithReactions =
+            result.rows.map(function (m) {
+
+                return Object.assign({}, m, {
+                    reactions: reactionsByMessage[m.id] ? Object.values(reactionsByMessage[m.id]) : []
+                });
+
+            });
+
         res.status(200).json({
             success: true,
-            messages: result.rows
+            messages: messagesWithReactions
         });
 
     } catch (error) {
@@ -8291,6 +8363,244 @@ app.post(
 
     }
 );
+
+
+// ========================================
+// REACT TO A MESSAGE (toggle)
+// ========================================
+
+app.post("/api/chat/messages/:id/react", async (req, res) => {
+
+    try {
+
+        const messageId = req.params.id;
+        const { studentId, emoji } = req.body;
+
+        if (!studentId || !emoji) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId or emoji."
+            });
+
+        }
+
+        const messageCheck = await pool.query(
+            `SELECT conversation_id FROM messages WHERE id = $1 LIMIT 1`,
+            [messageId]
+        );
+
+        if (messageCheck.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Message not found."
+            });
+
+        }
+
+        const membershipCheck = await pool.query(
+            `
+            SELECT 1 FROM conversation_participants
+            WHERE conversation_id = $1 AND student_id = $2
+            LIMIT 1
+            `,
+            [messageCheck.rows[0].conversation_id, studentId]
+        );
+
+        if (membershipCheck.rows.length === 0) {
+
+            return res.status(403).json({
+                success: false,
+                message: "You don't have access to this conversation."
+            });
+
+        }
+
+        // Toggle: if this exact reaction already exists from
+        // this student, remove it; otherwise set/replace it
+        // (one reaction per student per message).
+
+        const existing = await pool.query(
+            `SELECT emoji FROM message_reactions WHERE message_id = $1 AND student_id = $2`,
+            [messageId, studentId]
+        );
+
+        if (existing.rows.length > 0 && existing.rows[0].emoji === emoji) {
+
+            await pool.query(
+                `DELETE FROM message_reactions WHERE message_id = $1 AND student_id = $2`,
+                [messageId, studentId]
+            );
+
+        } else {
+
+            await pool.query(
+                `
+                INSERT INTO message_reactions (message_id, student_id, emoji)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (message_id, student_id)
+                DO UPDATE SET emoji = EXCLUDED.emoji
+                `,
+                [messageId, studentId, emoji]
+            );
+
+        }
+
+        const reactionsResult = await pool.query(
+            `SELECT emoji, student_id FROM message_reactions WHERE message_id = $1`,
+            [messageId]
+        );
+
+        const grouped = {};
+
+        reactionsResult.rows.forEach(function (r) {
+
+            if (!grouped[r.emoji]) {
+                grouped[r.emoji] = { emoji: r.emoji, count: 0, reactedByMe: false };
+            }
+
+            grouped[r.emoji].count += 1;
+
+            if (String(r.student_id) === String(studentId)) {
+                grouped[r.emoji].reactedByMe = true;
+            }
+
+        });
+
+        res.status(200).json({
+            success: true,
+            reactions: Object.values(grouped)
+        });
+
+    } catch (error) {
+
+        console.error(
+            "React to message error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not react to that message."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// EDIT A MESSAGE
+// (only the sender, only within 15 minutes
+// of sending, text messages only)
+// ========================================
+
+app.patch("/api/chat/messages/:id", async (req, res) => {
+
+    try {
+
+        const messageId = req.params.id;
+        const { studentId, body } = req.body;
+
+        if (!studentId || !body || !body.trim()) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Message cannot be empty."
+            });
+
+        }
+
+        const messageResult = await pool.query(
+            `SELECT * FROM messages WHERE id = $1 LIMIT 1`,
+            [messageId]
+        );
+
+        if (messageResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Message not found."
+            });
+
+        }
+
+        const message =
+            messageResult.rows[0];
+
+        if (String(message.sender_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "You can only edit your own messages."
+            });
+
+        }
+
+        if (message.message_type && message.message_type !== "TEXT") {
+
+            return res.status(400).json({
+                success: false,
+                message: "Only text messages can be edited."
+            });
+
+        }
+
+        const ageMs =
+            Date.now() - new Date(message.created_at).getTime();
+
+        if (ageMs > 15 * 60 * 1000) {
+
+            return res.status(400).json({
+                success: false,
+                message: "This message is too old to edit — edits are only allowed within 15 minutes."
+            });
+
+        }
+
+        const updateResult = await pool.query(
+            `
+            UPDATE messages
+            SET body = $1, edited_at = CURRENT_TIMESTAMP
+            WHERE id = $2
+            RETURNING *
+            `,
+            [body.trim(), messageId]
+        );
+
+        const updatedMessage =
+            updateResult.rows[0];
+
+        if (typeof io !== "undefined") {
+
+            io.to("student:" + updatedMessage.recipient_id).emit(
+                "message_edited",
+                updatedMessage
+            );
+
+        }
+
+        res.status(200).json({
+            success: true,
+            message: updatedMessage
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Edit message error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not edit this message."
+        });
+
+    }
+
+});
 
 
 // ========================================
