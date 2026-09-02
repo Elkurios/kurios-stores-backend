@@ -7647,39 +7647,41 @@ app.get("/api/chat/conversations", async (req, res) => {
         const result = await pool.query(
             `
             SELECT
+                conversations.id AS conversation_id,
+                conversations.type,
+                conversations.context_id,
                 partner.id,
                 partner.first_name,
                 partner.last_name,
                 partner.profile_picture,
+                product.name AS product_name,
                 latest.body AS last_message,
                 latest.created_at AS last_message_at,
                 latest.sender_id AS last_message_sender_id,
                 (
                     SELECT COUNT(*)::int
                     FROM messages
-                    WHERE recipient_id = $1
-                    AND sender_id = partner.id
+                    WHERE conversation_id = conversations.id
+                    AND recipient_id = $1
                     AND read_at IS NULL
                 ) AS unread_count
-            FROM (
-                SELECT DISTINCT
-                    CASE
-                        WHEN sender_id = $1 THEN recipient_id
-                        ELSE sender_id
-                    END AS partner_id
-                FROM messages
-                WHERE sender_id = $1 OR recipient_id = $1
-            ) AS partners
-            JOIN students AS partner ON partner.id = partners.partner_id
+            FROM conversation_participants my_cp
+            JOIN conversations ON conversations.id = my_cp.conversation_id
+            JOIN conversation_participants other_cp
+                ON other_cp.conversation_id = conversations.id
+                AND other_cp.student_id != $1
+            JOIN students AS partner ON partner.id = other_cp.student_id
             JOIN LATERAL (
                 SELECT body, created_at, sender_id
                 FROM messages
-                WHERE
-                    (sender_id = $1 AND recipient_id = partner.id)
-                    OR (sender_id = partner.id AND recipient_id = $1)
+                WHERE conversation_id = conversations.id
                 ORDER BY created_at DESC
                 LIMIT 1
             ) AS latest ON true
+            LEFT JOIN products AS product
+                ON product.id = conversations.context_id
+                AND conversations.type = 'PRODUCT'
+            WHERE my_cp.student_id = $1
             ORDER BY latest.created_at DESC
             `,
             [studentId]
@@ -7716,7 +7718,7 @@ app.get("/api/chat/messages", async (req, res) => {
 
     try {
 
-        const { studentId, withId } = req.query;
+        const { studentId, withId, conversationId } = req.query;
 
         if (!studentId || !withId) {
 
@@ -7727,17 +7729,58 @@ app.get("/api/chat/messages", async (req, res) => {
 
         }
 
-        const result = await pool.query(
-            `
-            SELECT *
-            FROM messages
-            WHERE
-                (sender_id = $1 AND recipient_id = $2)
-                OR (sender_id = $2 AND recipient_id = $1)
-            ORDER BY created_at ASC
-            `,
-            [studentId, withId]
-        );
+        let result;
+
+        if (conversationId) {
+
+            // Confirm this student is actually a participant
+            // before showing anything from this conversation.
+
+            const membershipCheck = await pool.query(
+                `
+                SELECT 1
+                FROM conversation_participants
+                WHERE conversation_id = $1
+                AND student_id = $2
+                LIMIT 1
+                `,
+                [conversationId, studentId]
+            );
+
+            if (membershipCheck.rows.length === 0) {
+
+                return res.status(403).json({
+                    success: false,
+                    message: "You don't have access to this conversation."
+                });
+
+            }
+
+            result = await pool.query(
+                `
+                SELECT *
+                FROM messages
+                WHERE conversation_id = $1
+                ORDER BY created_at ASC
+                `,
+                [conversationId]
+            );
+
+        } else {
+
+            result = await pool.query(
+                `
+                SELECT *
+                FROM messages
+                WHERE
+                    (sender_id = $1 AND recipient_id = $2)
+                    OR (sender_id = $2 AND recipient_id = $1)
+                ORDER BY created_at ASC
+                `,
+                [studentId, withId]
+            );
+
+        }
 
         await pool.query(
             `
@@ -7779,6 +7822,21 @@ app.get("/api/chat/messages", async (req, res) => {
 
 async function findOrCreateNormalConversation(studentA, studentB) {
 
+    return await findOrCreateConversation(studentA, studentB, "NORMAL", null);
+
+}
+
+
+// ========================================
+// FIND OR CREATE ANY CONVERSATION
+// (normal, or tied to a product/order/etc —
+// same two people can have a NORMAL chat
+// AND a separate PRODUCT chat about a
+// specific item, without them mixing)
+// ========================================
+
+async function findOrCreateConversation(studentA, studentB, type, contextId) {
+
     const existing = await pool.query(
         `
         SELECT cp1.conversation_id
@@ -7788,10 +7846,14 @@ async function findOrCreateNormalConversation(studentA, studentB) {
         JOIN conversations c ON c.id = cp1.conversation_id
         WHERE cp1.student_id = $1
         AND cp2.student_id = $2
-        AND c.type = 'NORMAL'
+        AND c.type = $3
+        AND (
+            ($4::int IS NULL AND c.context_id IS NULL)
+            OR c.context_id = $4
+        )
         LIMIT 1
         `,
-        [studentA, studentB]
+        [studentA, studentB, type, contextId]
     );
 
     if (existing.rows.length > 0) {
@@ -7799,7 +7861,8 @@ async function findOrCreateNormalConversation(studentA, studentB) {
     }
 
     const created = await pool.query(
-        `INSERT INTO conversations (type) VALUES ('NORMAL') RETURNING id`
+        `INSERT INTO conversations (type, context_id) VALUES ($1, $2) RETURNING id`,
+        [type, contextId]
     );
 
     const conversationId =
@@ -7827,7 +7890,7 @@ app.post("/api/chat/messages", async (req, res) => {
 
     try {
 
-        const { senderId, recipientId, body } = req.body;
+        const { senderId, recipientId, body, conversationId: requestedConversationId } = req.body;
 
         if (!senderId || !recipientId || !body || !body.trim()) {
 
@@ -7852,8 +7915,41 @@ app.post("/api/chat/messages", async (req, res) => {
 
         }
 
-        const conversationId =
-            await findOrCreateNormalConversation(senderId, recipientId);
+        let conversationId;
+
+        if (requestedConversationId) {
+
+            // Sending into a specific conversation (e.g. a
+            // product chat) — confirm real membership first.
+
+            const membershipCheck = await pool.query(
+                `
+                SELECT 1
+                FROM conversation_participants
+                WHERE conversation_id = $1
+                AND student_id = $2
+                LIMIT 1
+                `,
+                [requestedConversationId, senderId]
+            );
+
+            if (membershipCheck.rows.length === 0) {
+
+                return res.status(403).json({
+                    success: false,
+                    message: "You don't have access to this conversation."
+                });
+
+            }
+
+            conversationId = requestedConversationId;
+
+        } else {
+
+            conversationId =
+                await findOrCreateNormalConversation(senderId, recipientId);
+
+        }
 
         const result = await pool.query(
             `
@@ -8285,6 +8381,110 @@ io.on("connection", function (socket) {
         );
 
     });
+
+});
+
+
+// ========================================
+// CHAT — CONTACT SELLER ABOUT A PRODUCT
+// ========================================
+
+app.post("/api/chat/contact-seller", async (req, res) => {
+
+    try {
+
+        const { studentId, productId } = req.body;
+
+        if (!studentId || !productId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId or productId."
+            });
+
+        }
+
+        const productResult = await pool.query(
+            `
+            SELECT
+                products.id,
+                products.name,
+                products.seller_id,
+                sellers.student_id AS seller_student_id,
+                sellers.store_name
+            FROM products
+            LEFT JOIN sellers ON sellers.id = products.seller_id
+            WHERE products.id = $1
+            LIMIT 1
+            `,
+            [productId]
+        );
+
+        if (productResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Product not found."
+            });
+
+        }
+
+        const product =
+            productResult.rows[0];
+
+        if (!product.seller_student_id) {
+
+            return res.status(400).json({
+                success: false,
+                message: "This store hasn't linked a student account to chat with yet."
+            });
+
+        }
+
+        if (String(product.seller_student_id) === String(studentId)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "You can't start a chat about your own product."
+            });
+
+        }
+
+        const conversationId =
+            await findOrCreateConversation(
+                studentId,
+                product.seller_student_id,
+                "PRODUCT",
+                product.id
+            );
+
+        res.status(200).json({
+
+            success: true,
+
+            conversationId: conversationId,
+
+            sellerStudentId: product.seller_student_id,
+
+            storeName: product.store_name,
+
+            productName: product.name
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Contact seller error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not start a conversation with this seller."
+        });
+
+    }
 
 });
 
