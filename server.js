@@ -7583,7 +7583,7 @@ app.post("/api/chat/find", async (req, res) => {
 
         const result = await pool.query(
             `
-            SELECT id, first_name, last_name, profile_picture, university, phone
+            SELECT id, first_name, last_name, profile_picture, university, phone, whatsapp_number
             FROM students
             WHERE
                 RIGHT(regexp_replace(phone, '\\D', '', 'g'), 10) =
@@ -7656,6 +7656,8 @@ app.get("/api/chat/conversations", async (req, res) => {
                 partner.profile_picture,
                 partner.university,
                 partner.phone,
+                partner.whatsapp_number,
+                partner_seller.store_name AS partner_store_name,
                 product.name AS product_name,
                 latest.body AS last_message,
                 latest.created_at AS last_message_at,
@@ -7683,6 +7685,9 @@ app.get("/api/chat/conversations", async (req, res) => {
             LEFT JOIN products AS product
                 ON product.id = conversations.context_id
                 AND conversations.type = 'PRODUCT'
+            LEFT JOIN sellers AS partner_seller
+                ON partner_seller.student_id = partner.id
+                AND partner_seller.status = 'approved'
             WHERE my_cp.student_id = $1
             ORDER BY latest.created_at DESC
             `,
@@ -8326,6 +8331,39 @@ const io = new Server(httpServer, {
     }
 });
 
+
+// ========================================
+// REAL ONLINE PRESENCE
+// (a student can have multiple tabs/devices
+// connected at once, so we count connections
+// per student rather than a plain on/off flag —
+// they're only "offline" once every connection
+// has closed)
+// ========================================
+
+const onlineConnectionCounts = {};
+
+function markStudentOnline(studentId) {
+
+    onlineConnectionCounts[studentId] =
+        (onlineConnectionCounts[studentId] || 0) + 1;
+
+}
+
+function markStudentOffline(studentId) {
+
+    if (!onlineConnectionCounts[studentId]) {
+        return;
+    }
+
+    onlineConnectionCounts[studentId] -= 1;
+
+    if (onlineConnectionCounts[studentId] <= 0) {
+        delete onlineConnectionCounts[studentId];
+    }
+
+}
+
 io.on("connection", function (socket) {
 
     let joinedStudentId = null;
@@ -8356,6 +8394,8 @@ io.on("connection", function (socket) {
 
             socket.join("student:" + studentId);
 
+            markStudentOnline(studentId);
+
         } catch (error) {
 
             console.error(
@@ -8382,6 +8422,29 @@ io.on("connection", function (socket) {
             { fromStudentId: joinedStudentId }
         );
 
+    });
+
+
+    socket.on("disconnect", function () {
+
+        if (joinedStudentId) {
+            markStudentOffline(joinedStudentId);
+        }
+
+    });
+
+});
+
+
+// ========================================
+// WHO'S CURRENTLY ONLINE
+// ========================================
+
+app.get("/api/chat/online-students", function (req, res) {
+
+    res.status(200).json({
+        success: true,
+        onlineIds: Object.keys(onlineConnectionCounts)
     });
 
 });
