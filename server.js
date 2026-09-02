@@ -442,15 +442,22 @@ const chatAttachmentUpload = multer({
 
     fileFilter: function (req, file, cb) {
 
-        const allowedTypes = [
+        const allowedExactTypes = [
             "image/jpeg", "image/png", "image/webp", "image/gif",
             "application/pdf",
             "application/msword",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "audio/webm", "audio/ogg", "audio/mpeg", "audio/mp4", "audio/wav", "audio/x-m4a"
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         ];
 
-        if (allowedTypes.includes(file.mimetype)) {
+        // Voice note mimetypes vary by browser/device and often
+        // include a codec suffix (e.g. "audio/webm;codecs=opus"),
+        // so any real audio/* type is accepted rather than an
+        // exact-match list.
+
+        if (
+            allowedExactTypes.includes(file.mimetype) ||
+            file.mimetype.indexOf("audio/") === 0
+        ) {
             cb(null, true);
         } else {
             cb(new Error("That file type isn't supported."));
