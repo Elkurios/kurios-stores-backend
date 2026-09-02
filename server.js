@@ -7583,7 +7583,7 @@ app.post("/api/chat/find", async (req, res) => {
 
         const result = await pool.query(
             `
-            SELECT id, first_name, last_name, profile_picture
+            SELECT id, first_name, last_name, profile_picture, university, phone
             FROM students
             WHERE
                 RIGHT(regexp_replace(phone, '\\D', '', 'g'), 10) =
@@ -7654,6 +7654,8 @@ app.get("/api/chat/conversations", async (req, res) => {
                 partner.first_name,
                 partner.last_name,
                 partner.profile_picture,
+                partner.university,
+                partner.phone,
                 product.name AS product_name,
                 latest.body AS last_message,
                 latest.created_at AS last_message_at,
