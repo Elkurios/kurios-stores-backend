@@ -1212,6 +1212,167 @@ async function ensureMessagesTableExists() {
 
 
 // ========================================
+// CHAT — CONVERSATIONS SCHEMA
+// (unified conversation model: every thread
+// has a type + optional context, so the same
+// tables serve normal chats, product chats,
+// order chats, and support chats later —
+// instead of a separate table per use case)
+// ========================================
+
+async function ensureConversationsSchemaExists() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS conversations (
+                id SERIAL PRIMARY KEY,
+                type TEXT NOT NULL DEFAULT 'NORMAL',
+                context_id INTEGER,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS conversation_participants (
+                id SERIAL PRIMARY KEY,
+                conversation_id INTEGER REFERENCES conversations(id),
+                student_id INTEGER REFERENCES students(id),
+                last_read_at TIMESTAMP,
+                joined_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (conversation_id, student_id)
+            )
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE INDEX IF NOT EXISTS idx_conversation_participants_student
+            ON conversation_participants (student_id)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS conversation_id INTEGER REFERENCES conversations(id)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'TEXT'
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
+            ON messages (conversation_id)
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE INDEX IF NOT EXISTS idx_messages_created_at
+            ON messages (created_at)
+            `
+        );
+
+
+        // ====================================
+        // BACKFILL — every existing 1:1 message
+        // (from the old sender/recipient model)
+        // gets folded into a NORMAL conversation,
+        // so no chat history is lost.
+        // ====================================
+
+        const unmigratedPairs = await pool.query(
+            `
+            SELECT DISTINCT
+                LEAST(sender_id, recipient_id) AS student_a,
+                GREATEST(sender_id, recipient_id) AS student_b
+            FROM messages
+            WHERE conversation_id IS NULL
+            `
+        );
+
+        for (const pair of unmigratedPairs.rows) {
+
+            const conversationResult = await pool.query(
+                `
+                INSERT INTO conversations (type, context_id)
+                VALUES ('NORMAL', NULL)
+                RETURNING id
+                `
+            );
+
+            const conversationId =
+                conversationResult.rows[0].id;
+
+            await pool.query(
+                `
+                INSERT INTO conversation_participants (conversation_id, student_id)
+                VALUES ($1, $2), ($1, $3)
+                ON CONFLICT DO NOTHING
+                `,
+                [conversationId, pair.student_a, pair.student_b]
+            );
+
+            await pool.query(
+                `
+                UPDATE messages
+                SET conversation_id = $1
+                WHERE conversation_id IS NULL
+                AND (
+                    (sender_id = $2 AND recipient_id = $3)
+                    OR (sender_id = $3 AND recipient_id = $2)
+                )
+                `,
+                [conversationId, pair.student_a, pair.student_b]
+            );
+
+        }
+
+        if (unmigratedPairs.rows.length > 0) {
+
+            console.log(
+                "Backfilled " +
+                unmigratedPairs.rows.length +
+                " existing chat thread(s) into the new conversations schema."
+            );
+
+        }
+
+        console.log(
+            "Conversations schema is ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not set up conversations schema:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
 // WALLET TRANSACTIONS
 // (a ledger of every credit/debit to a
 // seller's wallet — right now only credits
@@ -1322,6 +1483,7 @@ async function runMigrations() {
     await ensureProductSellerColumnsExist();
     await seedKuriosStoresSeller();
     await ensureMessagesTableExists();
+    await ensureConversationsSchemaExists();
     await ensureWalletTransactionsTableExists();
     await ensureReviewsTableExists();
 
@@ -7611,6 +7773,53 @@ app.get("/api/chat/messages", async (req, res) => {
 
 
 // ========================================
+// FIND OR CREATE A NORMAL CONVERSATION
+// BETWEEN TWO STUDENTS
+// ========================================
+
+async function findOrCreateNormalConversation(studentA, studentB) {
+
+    const existing = await pool.query(
+        `
+        SELECT cp1.conversation_id
+        FROM conversation_participants cp1
+        JOIN conversation_participants cp2
+            ON cp1.conversation_id = cp2.conversation_id
+        JOIN conversations c ON c.id = cp1.conversation_id
+        WHERE cp1.student_id = $1
+        AND cp2.student_id = $2
+        AND c.type = 'NORMAL'
+        LIMIT 1
+        `,
+        [studentA, studentB]
+    );
+
+    if (existing.rows.length > 0) {
+        return existing.rows[0].conversation_id;
+    }
+
+    const created = await pool.query(
+        `INSERT INTO conversations (type) VALUES ('NORMAL') RETURNING id`
+    );
+
+    const conversationId =
+        created.rows[0].id;
+
+    await pool.query(
+        `
+        INSERT INTO conversation_participants (conversation_id, student_id)
+        VALUES ($1, $2), ($1, $3)
+        ON CONFLICT DO NOTHING
+        `,
+        [conversationId, studentA, studentB]
+    );
+
+    return conversationId;
+
+}
+
+
+// ========================================
 // CHAT — SEND A MESSAGE
 // ========================================
 
@@ -7643,18 +7852,44 @@ app.post("/api/chat/messages", async (req, res) => {
 
         }
 
+        const conversationId =
+            await findOrCreateNormalConversation(senderId, recipientId);
+
         const result = await pool.query(
             `
-            INSERT INTO messages (sender_id, recipient_id, body)
-            VALUES ($1, $2, $3)
+            INSERT INTO messages (sender_id, recipient_id, body, conversation_id)
+            VALUES ($1, $2, $3, $4)
             RETURNING *
             `,
-            [senderId, recipientId, body.trim()]
+            [senderId, recipientId, body.trim(), conversationId]
         );
+
+        await pool.query(
+            `UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [conversationId]
+        );
+
+        const savedMessage =
+            result.rows[0];
+
+
+        // Deliver in real time if the recipient is
+        // connected — the recipient's own poll/fetch
+        // remains the source of truth either way, this
+        // is purely for instant delivery.
+
+        if (typeof io !== "undefined") {
+
+            io.to("student:" + recipientId).emit(
+                "new_message",
+                savedMessage
+            );
+
+        }
 
         res.status(201).json({
             success: true,
-            message: result.rows[0]
+            message: savedMessage
         });
 
     } catch (error) {
@@ -7972,11 +8207,95 @@ app.get("/api/students/reviewable-products", async (req, res) => {
 
 
 // ========================================
+// REAL-TIME CHAT (Socket.IO)
+// ========================================
+
+/*
+    Requires "socket.io" in package.json —
+    see the note at the bottom of this file
+    for the exact dependency to add.
+*/
+
+const http = require("http");
+const { Server } = require("socket.io");
+
+const httpServer = http.createServer(app);
+
+const io = new Server(httpServer, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
+
+io.on("connection", function (socket) {
+
+    let joinedStudentId = null;
+
+
+    // A client must explicitly "join" with a real,
+    // existing student ID before it can receive
+    // anything — never trust a bare connection.
+
+    socket.on("join", async function (studentId) {
+
+        try {
+
+            if (!studentId) {
+                return;
+            }
+
+            const studentCheck = await pool.query(
+                `SELECT id FROM students WHERE id = $1 LIMIT 1`,
+                [studentId]
+            );
+
+            if (studentCheck.rows.length === 0) {
+                return;
+            }
+
+            joinedStudentId = studentId;
+
+            socket.join("student:" + studentId);
+
+        } catch (error) {
+
+            console.error(
+                "Socket join error:",
+                error.message
+            );
+
+        }
+
+    });
+
+
+    // Typing indicator — relayed to the other
+    // participant only, never broadcast widely.
+
+    socket.on("typing", function (data) {
+
+        if (!joinedStudentId || !data || !data.recipientId) {
+            return;
+        }
+
+        io.to("student:" + data.recipientId).emit(
+            "typing",
+            { fromStudentId: joinedStudentId }
+        );
+
+    });
+
+});
+
+
+// ========================================
 // START SERVER
 // ========================================
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+httpServer.listen(PORT, () => {
     console.log(`Kurios Stores server is running on port ${PORT}`);
+    console.log("Real-time chat (Socket.IO) is ready.");
 });
