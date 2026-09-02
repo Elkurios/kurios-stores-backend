@@ -402,6 +402,66 @@ const productImageUpload = multer({
 
 
 // ========================================
+// CHAT ATTACHMENTS
+// (images, documents, and voice notes —
+// broader file type allowance than the
+// product/profile image uploaders above)
+// ========================================
+
+const chatAttachmentStorage = multer.diskStorage({
+
+    destination: function (req, file, cb) {
+        cb(null, uploadsFolder);
+    },
+
+    filename: function (req, file, cb) {
+
+        const uniqueSuffix =
+            Date.now() +
+            "-" +
+            crypto.randomInt(100000, 999999);
+
+        cb(
+            null,
+            "chat-" +
+                uniqueSuffix +
+                path.extname(file.originalname)
+        );
+
+    }
+
+});
+
+const chatAttachmentUpload = multer({
+
+    storage: chatAttachmentStorage,
+
+    limits: {
+        fileSize: 10 * 1024 * 1024 // 10MB max
+    },
+
+    fileFilter: function (req, file, cb) {
+
+        const allowedTypes = [
+            "image/jpeg", "image/png", "image/webp", "image/gif",
+            "application/pdf",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "audio/webm", "audio/ogg", "audio/mpeg", "audio/mp4", "audio/wav", "audio/x-m4a"
+        ];
+
+        if (allowedTypes.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error("That file type isn't supported."));
+        }
+
+    }
+
+});
+
+
+// ========================================
 // CSV IMPORT UPLOAD
 // (kept in memory — we only need to parse
 // it, not store the file itself)
@@ -1274,6 +1334,27 @@ async function ensureConversationsSchemaExists() {
             `
             ALTER TABLE messages
             ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS attachment_url TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS attachment_name TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE messages
+            ADD COLUMN IF NOT EXISTS attachment_size INTEGER
             `
         );
 
@@ -7925,6 +8006,43 @@ async function findOrCreateConversation(studentA, studentB, type, contextId) {
 // CHAT — SEND A MESSAGE
 // ========================================
 
+// ========================================
+// RESOLVE WHICH CONVERSATION A MESSAGE
+// GOES INTO (shared by text + attachment
+// send endpoints)
+// ========================================
+
+async function resolveConversationForSend(senderId, recipientId, requestedConversationId) {
+
+    if (requestedConversationId) {
+
+        const membershipCheck = await pool.query(
+            `
+            SELECT 1
+            FROM conversation_participants
+            WHERE conversation_id = $1
+            AND student_id = $2
+            LIMIT 1
+            `,
+            [requestedConversationId, senderId]
+        );
+
+        if (membershipCheck.rows.length === 0) {
+            return { error: "You don't have access to this conversation." };
+        }
+
+        return { conversationId: requestedConversationId };
+
+    }
+
+    const conversationId =
+        await findOrCreateNormalConversation(senderId, recipientId);
+
+    return { conversationId };
+
+}
+
+
 app.post("/api/chat/messages", async (req, res) => {
 
     try {
@@ -7954,41 +8072,20 @@ app.post("/api/chat/messages", async (req, res) => {
 
         }
 
-        let conversationId;
+        const resolved =
+            await resolveConversationForSend(senderId, recipientId, requestedConversationId);
 
-        if (requestedConversationId) {
+        if (resolved.error) {
 
-            // Sending into a specific conversation (e.g. a
-            // product chat) — confirm real membership first.
-
-            const membershipCheck = await pool.query(
-                `
-                SELECT 1
-                FROM conversation_participants
-                WHERE conversation_id = $1
-                AND student_id = $2
-                LIMIT 1
-                `,
-                [requestedConversationId, senderId]
-            );
-
-            if (membershipCheck.rows.length === 0) {
-
-                return res.status(403).json({
-                    success: false,
-                    message: "You don't have access to this conversation."
-                });
-
-            }
-
-            conversationId = requestedConversationId;
-
-        } else {
-
-            conversationId =
-                await findOrCreateNormalConversation(senderId, recipientId);
+            return res.status(403).json({
+                success: false,
+                message: resolved.error
+            });
 
         }
+
+        const conversationId =
+            resolved.conversationId;
 
         const result = await pool.query(
             `
@@ -8042,6 +8139,158 @@ app.post("/api/chat/messages", async (req, res) => {
     }
 
 });
+
+
+// ========================================
+// SEND AN ATTACHMENT (image, file, or
+// voice note)
+// ========================================
+
+app.post(
+    "/api/chat/messages/attachment",
+    function (req, res, next) {
+
+        chatAttachmentUpload.single("file")(req, res, function (err) {
+
+            if (err) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: err.message || "Could not upload that file."
+                });
+
+            }
+
+            next();
+
+        });
+
+    },
+    async (req, res) => {
+
+        try {
+
+            const { senderId, recipientId, conversationId: requestedConversationId, messageType } = req.body;
+
+            if (!req.file) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "No file was uploaded."
+                });
+
+            }
+
+            if (!senderId || !recipientId) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Missing senderId or recipientId."
+                });
+
+            }
+
+            const recipientCheck = await pool.query(
+                `SELECT id FROM students WHERE id = $1 LIMIT 1`,
+                [recipientId]
+            );
+
+            if (recipientCheck.rows.length === 0) {
+
+                return res.status(404).json({
+                    success: false,
+                    message: "That student could not be found."
+                });
+
+            }
+
+            const resolved =
+                await resolveConversationForSend(senderId, recipientId, requestedConversationId);
+
+            if (resolved.error) {
+
+                return res.status(403).json({
+                    success: false,
+                    message: resolved.error
+                });
+
+            }
+
+            const conversationId =
+                resolved.conversationId;
+
+            const attachmentUrl =
+                "/uploads/" + req.file.filename;
+
+            const resolvedType =
+                (messageType === "VOICE" || messageType === "IMAGE" || messageType === "FILE") ?
+                    messageType :
+                    (req.file.mimetype.startsWith("image/") ? "IMAGE" : "FILE");
+
+            const bodyText =
+                resolvedType === "VOICE" ?
+                    "Voice note" :
+                    (resolvedType === "IMAGE" ? "Photo" : req.file.originalname);
+
+            const result = await pool.query(
+                `
+                INSERT INTO messages (
+                    sender_id, recipient_id, body, conversation_id,
+                    message_type, attachment_url, attachment_name, attachment_size
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING *
+                `,
+                [
+                    senderId,
+                    recipientId,
+                    bodyText,
+                    conversationId,
+                    resolvedType,
+                    attachmentUrl,
+                    req.file.originalname,
+                    req.file.size
+                ]
+            );
+
+            await pool.query(
+                `UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+                [conversationId]
+            );
+
+            const savedMessage =
+                result.rows[0];
+
+            if (typeof io !== "undefined") {
+
+                io.to("student:" + recipientId).emit(
+                    "new_message",
+                    savedMessage
+                );
+
+            }
+
+            res.status(201).json({
+                success: true,
+                message: savedMessage
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Send attachment error:",
+                error.message
+            );
+
+            res.status(500).json({
+                success: false,
+                message: "Could not send that attachment."
+            });
+
+        }
+
+    }
+);
 
 
 // ========================================
