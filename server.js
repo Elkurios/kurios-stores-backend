@@ -728,8 +728,15 @@ async function ensureProfileColumnsExist() {
             `
         );
 
+        await pool.query(
+            `
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS is_support BOOLEAN DEFAULT false
+            `
+        );
+
         console.log(
-            "Profile columns (date_of_birth, profile_picture, is_suspended) are ready."
+            "Profile columns (date_of_birth, profile_picture, is_suspended, is_support) are ready."
         );
 
     } catch (error) {
@@ -5587,6 +5594,7 @@ app.get(
                     student_id,
                     email_verified,
                     is_suspended,
+                    is_support,
                     created_at
                 FROM students
                 `;
@@ -5696,6 +5704,60 @@ async function setStudentSuspension(req, res, suspended) {
 
 }
 
+async function setStudentSupportStatus(req, res, isSupport) {
+
+    try {
+
+        const { id } = req.params;
+
+        const result = await pool.query(
+            `
+            UPDATE students
+            SET is_support = $1, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $2
+            RETURNING id, first_name, last_name, email, is_support
+            `,
+            [isSupport, id]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Student account could not be found."
+            });
+
+        }
+
+        res.status(200).json({
+
+            success: true,
+
+            message:
+                isSupport ?
+                    "This account is now KSupport staff." :
+                    "KSupport access removed from this account.",
+
+            student: result.rows[0]
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Update student support status error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not update this student's account."
+        });
+
+    }
+
+}
+
 app.post(
     "/api/admin/students/:id/suspend",
     requireAdminAuth,
@@ -5706,6 +5768,18 @@ app.post(
     "/api/admin/students/:id/unsuspend",
     requireAdminAuth,
     (req, res) => setStudentSuspension(req, res, false)
+);
+
+app.post(
+    "/api/admin/students/:id/make-support",
+    requireAdminAuth,
+    (req, res) => setStudentSupportStatus(req, res, true)
+);
+
+app.post(
+    "/api/admin/students/:id/remove-support",
+    requireAdminAuth,
+    (req, res) => setStudentSupportStatus(req, res, false)
 );
 
 
@@ -9044,6 +9118,117 @@ app.get("/api/chat/online-students", function (req, res) {
         success: true,
         onlineIds: Object.keys(onlineConnectionCounts)
     });
+
+});
+
+
+// ========================================
+// CONTACT SUPPORT (KSupport)
+// ========================================
+
+app.post("/api/chat/contact-support", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const studentCheck = await pool.query(
+            `SELECT id, is_support FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (studentCheck.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Student not found."
+            });
+
+        }
+
+        if (studentCheck.rows[0].is_support) {
+
+            return res.status(400).json({
+                success: false,
+                message: "You're a KSupport staff member — support requests come to you, not from you."
+            });
+
+        }
+
+        // Pick the support staff member currently handling
+        // the fewest open support conversations, so requests
+        // spread out rather than piling on one person.
+
+        const supportStaffResult = await pool.query(
+            `
+            SELECT
+                students.id,
+                students.first_name,
+                students.last_name,
+                (
+                    SELECT COUNT(*)::int
+                    FROM conversation_participants cp
+                    JOIN conversations c ON c.id = cp.conversation_id
+                    WHERE cp.student_id = students.id
+                    AND c.type = 'SUPPORT'
+                ) AS open_support_chats
+            FROM students
+            WHERE students.is_support = true
+            ORDER BY open_support_chats ASC, students.id ASC
+            LIMIT 1
+            `
+        );
+
+        if (supportStaffResult.rows.length === 0) {
+
+            return res.status(503).json({
+                success: false,
+                message: "Kurios Stores Support isn't available right now — please try again shortly."
+            });
+
+        }
+
+        const supportStaff =
+            supportStaffResult.rows[0];
+
+        const conversationId =
+            await findOrCreateConversation(studentId, supportStaff.id, "SUPPORT", null);
+
+        res.status(200).json({
+
+            success: true,
+
+            conversationId: conversationId,
+
+            supportStudentId: supportStaff.id,
+
+            supportName:
+                [supportStaff.first_name, supportStaff.last_name].filter(Boolean).join(" ") || "Kurios Stores Support"
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Contact support error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not start a conversation with support."
+        });
+
+    }
 
 });
 
