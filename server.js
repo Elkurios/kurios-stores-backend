@@ -1478,6 +1478,70 @@ async function ensureConversationsSchemaExists() {
 
         }
 
+
+        // ====================================
+        // MERGE DUPLICATE CONVERSATIONS
+        // (a student pair should only ever have
+        // ONE conversation per type+context — this
+        // cleans up any duplicates that slipped in
+        // before that was consistently enforced)
+        // ====================================
+
+        const duplicateGroups = await pool.query(
+            `
+            SELECT
+                LEAST(cp1.student_id, cp2.student_id) AS student_a,
+                GREATEST(cp1.student_id, cp2.student_id) AS student_b,
+                c.type,
+                c.context_id,
+                array_agg(c.id ORDER BY c.id ASC) AS conversation_ids
+            FROM conversations c
+            JOIN conversation_participants cp1 ON cp1.conversation_id = c.id
+            JOIN conversation_participants cp2
+                ON cp2.conversation_id = c.id
+                AND cp2.student_id != cp1.student_id
+            GROUP BY student_a, student_b, c.type, c.context_id
+            HAVING COUNT(DISTINCT c.id) > 1
+            `
+        );
+
+        for (const group of duplicateGroups.rows) {
+
+            const ids = group.conversation_ids;
+            const keepId = ids[0];
+            const duplicateIds = ids.slice(1);
+
+            for (const dupId of duplicateIds) {
+
+                await pool.query(
+                    `UPDATE messages SET conversation_id = $1 WHERE conversation_id = $2`,
+                    [keepId, dupId]
+                );
+
+                await pool.query(
+                    `DELETE FROM conversation_participants WHERE conversation_id = $1`,
+                    [dupId]
+                );
+
+                await pool.query(
+                    `DELETE FROM conversations WHERE id = $1`,
+                    [dupId]
+                );
+
+            }
+
+        }
+
+        if (duplicateGroups.rows.length > 0) {
+
+            console.log(
+                "Merged " +
+                duplicateGroups.rows.length +
+                " duplicate conversation group(s)."
+            );
+
+        }
+
         console.log(
             "Conversations schema is ready."
         );
@@ -7824,9 +7888,16 @@ app.post("/api/chat/find", async (req, res) => {
 
         }
 
+        const foundStudent =
+            result.rows[0];
+
+        const conversationId =
+            await findOrCreateConversation(studentId, foundStudent.id, "NORMAL", null);
+
         res.status(200).json({
             success: true,
-            student: result.rows[0]
+            student: foundStudent,
+            conversationId: conversationId
         });
 
     } catch (error) {
@@ -8124,6 +8195,7 @@ async function findOrCreateConversation(studentA, studentB, type, contextId) {
             ($4::int IS NULL AND c.context_id IS NULL)
             OR c.context_id = $4
         )
+        ORDER BY c.id ASC
         LIMIT 1
         `,
         [studentA, studentB, type, contextId]
