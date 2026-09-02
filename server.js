@@ -1615,6 +1615,40 @@ app.post("/api/students/register", async (req, res) => {
 
 
         // ====================================
+        // PHONE NUMBER FORMAT
+        // ====================================
+
+        const digitsOnlyPhone =
+            phone.replace(/\D/g, "");
+
+        if (!/^0\d{10}$/.test(digitsOnlyPhone)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a complete, valid phone number (11 digits, starting with 0)."
+            });
+
+        }
+
+
+        // ====================================
+        // WHATSAPP NUMBER FORMAT
+        // ====================================
+
+        const digitsOnlyWhatsapp =
+            whatsappNumber.replace(/\D/g, "");
+
+        if (!/^0\d{10}$/.test(digitsOnlyWhatsapp)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a complete, valid WhatsApp number (11 digits, starting with 0)."
+            });
+
+        }
+
+
+        // ====================================
         // PASSCODE MATCH
         // ====================================
 
@@ -2089,10 +2123,8 @@ if (emailCheck.rows.length > 0) {
                 firstName.trim(),
                 lastName.trim(),
                 email.trim(),
-                phone.trim(),
-                whatsappNumber
-                    ? whatsappNumber.trim()
-                    : null,
+                digitsOnlyPhone,
+                digitsOnlyWhatsapp,
                 university.trim(),
                 studentId.trim(),
                 passwordHash,
