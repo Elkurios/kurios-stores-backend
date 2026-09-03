@@ -84,6 +84,98 @@ const OPAY_CALLBACK_URL =
 
 
 // ========================================
+// PAYSTACK PAYMENT CONFIGURATION
+// ========================================
+
+/*
+    Put these in your .env file:
+
+    PAYSTACK_SECRET_KEY=sk_test_...
+    PAYSTACK_PUBLIC_KEY=pk_test_...
+
+    Switch to your sk_live_.../pk_live_... keys
+    when you go live.
+*/
+
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY;
+const PAYSTACK_BASE_URL = "https://api.paystack.co";
+
+const PAYSTACK_CALLBACK_URL =
+    BACKEND_URL + "/api/paystack/callback";
+
+
+// ========================================
+// INITIALIZE A PAYSTACK TRANSACTION
+// ========================================
+
+async function initializePaystackTransaction({ reference, amountNaira, email, callbackUrl }) {
+
+    if (!PAYSTACK_SECRET_KEY) {
+        throw new Error("Paystack is not configured on this server yet.");
+    }
+
+    const response = await fetch(
+        PAYSTACK_BASE_URL + "/transaction/initialize",
+        {
+            method: "POST",
+            headers: {
+                "Authorization": "Bearer " + PAYSTACK_SECRET_KEY,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                reference: reference,
+                amount: Math.round(amountNaira * 100), // Paystack uses kobo
+                email: email || "student@kuriosstores.com",
+                callback_url: callbackUrl || PAYSTACK_CALLBACK_URL
+            }),
+            signal: AbortSignal.timeout(15000)
+        }
+    );
+
+    const data = await response.json();
+
+    if (!data.status) {
+        throw new Error(data.message || "Could not start Paystack checkout.");
+    }
+
+    return data.data; // { authorization_url, access_code, reference }
+
+}
+
+
+// ========================================
+// VERIFY A PAYSTACK TRANSACTION
+// ========================================
+
+async function verifyPaystackTransaction(reference) {
+
+    if (!PAYSTACK_SECRET_KEY) {
+        throw new Error("Paystack is not configured on this server yet.");
+    }
+
+    const response = await fetch(
+        PAYSTACK_BASE_URL + "/transaction/verify/" + encodeURIComponent(reference),
+        {
+            headers: {
+                "Authorization": "Bearer " + PAYSTACK_SECRET_KEY
+            },
+            signal: AbortSignal.timeout(15000)
+        }
+    );
+
+    const data = await response.json();
+
+    if (!data.status) {
+        throw new Error(data.message || "Could not verify this payment with Paystack.");
+    }
+
+    return data.data; // { status: 'success'|'failed'|..., amount, reference, ... }
+
+}
+
+
+// ========================================
 // SIGN AN OPAY REQUEST
 // ========================================
 
@@ -4060,6 +4152,48 @@ async function verifyAndUpdateOrder(paymentReference) {
 
 
     // ========================================
+    // PAYSTACK
+    // ========================================
+
+    if (order.payment_gateway === "paystack") {
+
+        let paystackData;
+
+        try {
+
+            paystackData =
+                await verifyPaystackTransaction(paymentReference);
+
+        } catch (error) {
+
+            return {
+                success: false,
+                message: "Could not verify this payment with Paystack.",
+                order: order
+            };
+
+        }
+
+        const isPaid =
+            paystackData.status === "success" &&
+            Number(paystackData.amount) >= Math.round(Number(order.amount) * 100);
+
+        const isFailed =
+            paystackData.status === "failed" ||
+            paystackData.status === "abandoned";
+
+        return await applyOrderPaymentResult(
+            order,
+            isPaid,
+            isFailed,
+            paystackData.id,
+            paystackData.status
+        );
+
+    }
+
+
+    // ========================================
     // MONNIFY (default)
     // ========================================
 
@@ -4390,6 +4524,79 @@ app.post("/api/orders/pay/opay", async (req, res) => {
 
 
 // ========================================
+// GET PAYSTACK CHECKOUT DETAILS FOR AN ORDER
+// ========================================
+
+app.post("/api/orders/pay/paystack", async (req, res) => {
+
+    try {
+
+        const { paymentReference, returnUrl, customerEmail } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const orderResult = await pool.query(
+            `SELECT * FROM orders WHERE payment_reference = $1 LIMIT 1`,
+            [paymentReference]
+        );
+
+        if (orderResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Order not found."
+            });
+
+        }
+
+        const order = orderResult.rows[0];
+
+        const paystackData =
+            await initializePaystackTransaction({
+                reference: paymentReference,
+                amountNaira: Number(order.amount),
+                email: customerEmail,
+                callbackUrl: returnUrl
+            });
+
+        await pool.query(
+            `UPDATE orders SET payment_gateway = 'paystack' WHERE id = $1`,
+            [order.id]
+        );
+
+        res.status(200).json({
+
+            success: true,
+
+            authorizationUrl: paystackData.authorization_url
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Order Paystack checkout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: error.message || "Could not start Paystack checkout."
+        });
+
+    }
+
+});
+
+
+// ========================================
 // VERIFY A CHECKOUT (called right after
 // the Monnify widget closes)
 // ========================================
@@ -4548,6 +4755,83 @@ app.post("/api/opay/webhook", async (req, res) => {
         res.status(200).send("error logged");
 
     }
+
+});
+
+
+// ========================================
+// PAYSTACK WEBHOOK
+// (catches payments even if the student
+// closes the browser before we can verify)
+// ========================================
+
+app.post("/api/paystack/webhook", async (req, res) => {
+
+    try {
+
+        const paymentReference =
+            req.body &&
+            req.body.data &&
+            req.body.data.reference;
+
+        if (!paymentReference) {
+
+            return res.status(200).send("ignored");
+
+        }
+
+        if (paymentReference.startsWith("kurios_seller_")) {
+
+            await verifyAndUpdateSellerPayment(
+                paymentReference
+            );
+
+        } else {
+
+            await verifyAndUpdateOrder(
+                paymentReference
+            );
+
+        }
+
+        res.status(200).send("ok");
+
+    } catch (error) {
+
+        console.error(
+            "Paystack webhook error:",
+            error.message
+        );
+
+        res.status(200).send("error logged");
+
+    }
+
+});
+
+
+// ========================================
+// PAYSTACK CALLBACK
+// (the browser lands here after checkout —
+// just bounces to the frontend, which then
+// calls /api/orders/verify or the seller
+// equivalent using the reference in the URL)
+// ========================================
+
+app.get("/api/paystack/callback", async (req, res) => {
+
+    const reference =
+        req.query.reference || req.query.trxref || "";
+
+    const isSellerPayment =
+        reference.startsWith("kurios_seller_");
+
+    const frontendUrl =
+        (process.env.FRONTEND_URL || "https://kuriosstores.com") +
+        (isSellerPayment ? "/#sell" : "/") +
+        "?paystack_reference=" + encodeURIComponent(reference);
+
+    res.redirect(frontendUrl);
 
 });
 
@@ -5169,6 +5453,86 @@ app.post("/api/sellers/apply/pay/opay", async (req, res) => {
 
 
 // ========================================
+// GET PAYSTACK CHECKOUT DETAILS FOR A
+// SELLER APPLICATION FEE
+// ========================================
+
+app.post("/api/sellers/apply/pay/paystack", async (req, res) => {
+
+    try {
+
+        const { paymentReference, returnUrl } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const sellerResult = await pool.query(
+            `
+            SELECT sellers.*, students.email
+            FROM sellers
+            LEFT JOIN students ON students.id = sellers.student_id
+            WHERE sellers.payment_reference = $1
+            LIMIT 1
+            `,
+            [paymentReference]
+        );
+
+        if (sellerResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Seller application not found."
+            });
+
+        }
+
+        const seller = sellerResult.rows[0];
+
+        const paystackData =
+            await initializePaystackTransaction({
+                reference: paymentReference,
+                amountNaira: Number(seller.application_fee),
+                email: seller.email,
+                callbackUrl: returnUrl
+            });
+
+        await pool.query(
+            `UPDATE sellers SET payment_gateway = 'paystack' WHERE id = $1`,
+            [seller.id]
+        );
+
+        res.status(200).json({
+
+            success: true,
+
+            authorizationUrl: paystackData.authorization_url
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Seller Paystack checkout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: error.message || "Could not start Paystack checkout."
+        });
+
+    }
+
+});
+
+
+// ========================================
 // VERIFY A SELLER APPLICATION FEE PAYMENT
 // ========================================
 
@@ -5279,6 +5643,48 @@ async function verifyAndUpdateSellerPayment(paymentReference) {
             isFailed,
             opayData.orderNo,
             opayData.status
+        );
+
+    }
+
+
+    // ========================================
+    // PAYSTACK
+    // ========================================
+
+    if (seller.payment_gateway === "paystack") {
+
+        let paystackData;
+
+        try {
+
+            paystackData =
+                await verifyPaystackTransaction(paymentReference);
+
+        } catch (error) {
+
+            return {
+                success: false,
+                message: "Could not verify this payment with Paystack.",
+                seller: seller
+            };
+
+        }
+
+        const isPaid =
+            paystackData.status === "success" &&
+            Number(paystackData.amount) >= Math.round(Number(seller.application_fee) * 100);
+
+        const isFailed =
+            paystackData.status === "failed" ||
+            paystackData.status === "abandoned";
+
+        return await applySellerPaymentResult(
+            seller,
+            isPaid,
+            isFailed,
+            paystackData.id,
+            paystackData.status
         );
 
     }
