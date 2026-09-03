@@ -1538,6 +1538,27 @@ async function ensureConversationsSchemaExists() {
 
         await pool.query(
             `
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS ticket_number TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS ticket_number TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP
+            `
+        );
+
+        await pool.query(
+            `
             CREATE TABLE IF NOT EXISTS message_reactions (
                 id SERIAL PRIMARY KEY,
                 message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
@@ -1701,6 +1722,149 @@ async function ensureConversationsSchemaExists() {
 }
 
 
+
+// ========================================
+// KSUPPORT SYSTEM ACCOUNT
+// (a real student row used as the sender
+// for automated ticket messages — "Elkurios"
+// speaks through this account)
+// ========================================
+
+let ksupportSystemAccountId = null;
+
+async function ensureKSupportSystemAccount() {
+
+    try {
+
+        const existing = await pool.query(
+            `SELECT id FROM students WHERE email = 'system@kuriosstores.com' LIMIT 1`
+        );
+
+        if (existing.rows.length > 0) {
+
+            ksupportSystemAccountId = existing.rows[0].id;
+            return;
+
+        }
+
+        const created = await pool.query(
+            `
+            INSERT INTO students (
+                first_name, last_name, email, phone, university, student_id,
+                password_hash, email_verified, is_support
+            )
+            VALUES (
+                'Elkurios', '', 'system@kuriosstores.com', '00000000000',
+                'Kurios Stores', 'SYSTEM', 'no-login', true, true
+            )
+            RETURNING id
+            `
+        );
+
+        ksupportSystemAccountId = created.rows[0].id;
+
+        console.log(
+            "KSupport system account created (id " + ksupportSystemAccountId + ")."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not set up KSupport system account:",
+            error.message
+        );
+
+    }
+
+}
+
+function generateTicketNumber() {
+
+    return "#" + Math.floor(100000 + Math.random() * 900000);
+
+}
+
+async function sendKSupportAutoMessage(conversationId, recipientId, body) {
+
+    if (!ksupportSystemAccountId) {
+        return;
+    }
+
+    try {
+
+        const result = await pool.query(
+            `
+            INSERT INTO messages (sender_id, recipient_id, body, conversation_id, message_type)
+            VALUES ($1, $2, $3, $4, 'TEXT')
+            RETURNING *
+            `,
+            [ksupportSystemAccountId, recipientId, body, conversationId]
+        );
+
+        await pool.query(
+            `UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [conversationId]
+        );
+
+        if (typeof io !== "undefined" && recipientId) {
+
+            io.to("student:" + recipientId).emit(
+                "new_message",
+                result.rows[0]
+            );
+
+        }
+
+    } catch (error) {
+
+        console.error(
+            "Send KSupport auto message error:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
+// KSUPPORT MESSAGE TEMPLATES
+// ========================================
+
+const KSUPPORT_TEMPLATES = {
+
+    received: function (ticketNumber) {
+        return `Thank you for chatting with KSupport.\nFor reference, please note that your ticket number is ${ticketNumber}.\nA member of our support team will attend to you as soon as possible. In the meantime, kindly state your complaint or describe the issue you are experiencing so we can better understand and assist you.\nWe appreciate your patience.\nKSupport — We're here to help.`;
+    },
+
+    assigned: function (ticketNumber, studentName) {
+        return `Hello ${studentName},\nYour support request ${ticketNumber} has been assigned to a KSupport Staff and is now being attended to.\nThe support staff will review your complaint and respond to you shortly. Kindly remain available in case additional information or clarification is required.\nThank you for your patience and for choosing KSupport.\nKSupport — We're here to help.`;
+    },
+
+    resolved: function (ticketNumber, studentName) {
+        return `Hello ${studentName},\nYour support request ${ticketNumber} has been resolved by KSupport.\nWe hope your issue has been satisfactorily addressed. If you need further assistance regarding this matter, you may reopen the ticket or submit a new support request.\nThank you for using KSupport.\nKSupport — We're here to help.`;
+    },
+
+    closed: function (ticketNumber, studentName) {
+        return `Hello ${studentName},\nYour support request ${ticketNumber} has now been closed.\nThank you for contacting KSupport. We appreciate your patience and the opportunity to assist you.\nIf you require further assistance, you can always submit a new support request.\nKSupport — We're here to help.`;
+    },
+
+    reopened: function (ticketNumber, studentName) {
+        return `Hello ${studentName},\nYour support request ${ticketNumber} has been reopened.\nA KSupport staff member will review the request and continue working with you to resolve the issue.\nThank you for contacting KSupport.\nKSupport — We're here to help.`;
+    },
+
+    transferred: function (ticketNumber, studentName) {
+        return `Hello ${studentName},\nYour support request ${ticketNumber} has been transferred to another KSupport staff member to ensure that your issue is handled by the appropriate support personnel.\nThe new support staff will review your complaint and continue assisting you shortly.\nThank you for your patience and understanding.\nKSupport — We're here to help.`;
+    },
+
+    infoRequested: function (ticketNumber, studentName) {
+        return `Hello ${studentName},\nTo help us resolve your support request ${ticketNumber}, we need some additional information from you.\nKindly provide the requested details so our support staff can proceed with resolving your complaint.\nThank you for your cooperation.\nKSupport — We're here to help.`;
+    }
+
+};
+
+
+
 // ========================================
 // WALLET TRANSACTIONS
 // (a ledger of every credit/debit to a
@@ -1813,6 +1977,7 @@ async function runMigrations() {
     await seedKuriosStoresSeller();
     await ensureMessagesTableExists();
     await ensureConversationsSchemaExists();
+    await ensureKSupportSystemAccount();
     await ensureWalletTransactionsTableExists();
     await ensureReviewsTableExists();
 
@@ -9254,6 +9419,10 @@ app.get("/api/chat/conversations", async (req, res) => {
                 AND partner_seller.status = 'approved'
                 AND conversations.type != 'SUPPORT'
             WHERE my_cp.student_id = $1
+            AND NOT (
+                conversations.type = 'SUPPORT'
+                AND EXISTS (SELECT 1 FROM students WHERE id = $1 AND is_support = true)
+            )
             ORDER BY latest.created_at DESC
             `,
             [studentId]
@@ -9611,6 +9780,41 @@ app.post("/api/chat/messages", async (req, res) => {
                     success: false,
                     message: "You don't have access to this conversation."
                 });
+
+            }
+
+            // Extra rule for support tickets specifically: being
+            // a participant isn't enough on its own — a support
+            // staffer must have actually claimed this ticket
+            // before they're allowed to respond in it. The
+            // student who opened the ticket can always send.
+
+            const conversationCheck = await pool.query(
+                `SELECT type, claimed_by FROM conversations WHERE id = $1 LIMIT 1`,
+                [requestedConversationId]
+            );
+
+            if (conversationCheck.rows.length > 0 && conversationCheck.rows[0].type === "SUPPORT") {
+
+                const senderCheck = await pool.query(
+                    `SELECT is_support FROM students WHERE id = $1 LIMIT 1`,
+                    [senderId]
+                );
+
+                const senderIsSupportStaff =
+                    senderCheck.rows.length > 0 && senderCheck.rows[0].is_support;
+
+                if (
+                    senderIsSupportStaff &&
+                    String(conversationCheck.rows[0].claimed_by) !== String(senderId)
+                ) {
+
+                    return res.status(403).json({
+                        success: false,
+                        message: "You need to pick up this ticket from the Support Pool before you can respond."
+                    });
+
+                }
 
             }
 
@@ -10599,19 +10803,30 @@ app.post("/api/chat/contact-support", async (req, res) => {
         );
 
         let conversationId;
+        let ticketNumber;
 
         if (existing.rows.length > 0) {
 
             conversationId = existing.rows[0].id;
 
+            const existingTicket = await pool.query(
+                `SELECT ticket_number FROM conversations WHERE id = $1`,
+                [conversationId]
+            );
+
+            ticketNumber = existingTicket.rows[0].ticket_number;
+
         } else {
+
+            ticketNumber = generateTicketNumber();
 
             const created = await pool.query(
                 `
-                INSERT INTO conversations (type, support_status)
-                VALUES ('SUPPORT', 'open')
+                INSERT INTO conversations (type, support_status, ticket_number)
+                VALUES ('SUPPORT', 'open', $1)
                 RETURNING id
-                `
+                `,
+                [ticketNumber]
             );
 
             conversationId = created.rows[0].id;
@@ -10625,6 +10840,16 @@ app.post("/api/chat/contact-support", async (req, res) => {
                 [conversationId, studentId]
             );
 
+            // Automated "we got your request" message —
+            // this is what makes the ticket feel answered
+            // immediately, even before anyone picks it up.
+
+            await sendKSupportAutoMessage(
+                conversationId,
+                studentId,
+                KSUPPORT_TEMPLATES.received(ticketNumber)
+            );
+
         }
 
         res.status(200).json({
@@ -10632,6 +10857,8 @@ app.post("/api/chat/contact-support", async (req, res) => {
             success: true,
 
             conversationId: conversationId,
+
+            ticketNumber: ticketNumber,
 
             // The student never sees a real staffer's
             // identity — support always answers as Elkurios,
@@ -10699,15 +10926,26 @@ app.get("/api/support/pool", async (req, res) => {
             SELECT
                 conversations.id AS conversation_id,
                 conversations.created_at,
+                conversations.support_status,
+                conversations.ticket_number,
+                conversations.claimed_at,
+                conversations.resolved_at,
                 student.id AS student_id,
                 student.first_name,
                 student.last_name,
                 student.university,
+                staffer.id AS claimed_by_id,
+                staffer.first_name AS claimed_by_first_name,
+                staffer.last_name AS claimed_by_last_name,
                 latest.body AS last_message,
                 latest.created_at AS last_message_at
             FROM conversations
             JOIN conversation_participants cp ON cp.conversation_id = conversations.id
-            JOIN students AS student ON student.id = cp.student_id
+            JOIN students AS student
+                ON student.id = cp.student_id
+                AND student.is_support = false
+            LEFT JOIN students AS staffer
+                ON staffer.id = conversations.claimed_by
             LEFT JOIN LATERAL (
                 SELECT body, created_at
                 FROM messages
@@ -10716,8 +10954,14 @@ app.get("/api/support/pool", async (req, res) => {
                 LIMIT 1
             ) AS latest ON true
             WHERE conversations.type = 'SUPPORT'
-            AND conversations.support_status = 'open'
-            ORDER BY conversations.created_at ASC
+            ORDER BY
+                CASE conversations.support_status
+                    WHEN 'open' THEN 0
+                    WHEN 'claimed' THEN 1
+                    WHEN 'resolved' THEN 2
+                    ELSE 3
+                END,
+                conversations.created_at DESC
             `
         );
 
@@ -10826,10 +11070,38 @@ app.post("/api/support/pool/:conversationId/claim", async (req, res) => {
             [conversationId, studentId]
         );
 
+        const requesterResult = await pool.query(
+            `
+            SELECT student.id, student.first_name
+            FROM conversation_participants cp
+            JOIN students AS student ON student.id = cp.student_id AND student.is_support = false
+            WHERE cp.conversation_id = $1
+            LIMIT 1
+            `,
+            [conversationId]
+        );
+
+        if (requesterResult.rows.length > 0) {
+
+            const requester =
+                requesterResult.rows[0];
+
+            await sendKSupportAutoMessage(
+                conversationId,
+                requester.id,
+                KSUPPORT_TEMPLATES.assigned(
+                    conversation.ticket_number || "your ticket",
+                    requester.first_name || "there"
+                )
+            );
+
+        }
+
         res.status(200).json({
             success: true,
             message: "Conversation claimed.",
-            conversationId: Number(conversationId)
+            conversationId: Number(conversationId),
+            ticketNumber: conversation.ticket_number
         });
 
     } catch (error) {
@@ -10856,7 +11128,49 @@ app.post("/api/support/pool/:conversationId/claim", async (req, res) => {
 // fresh support request later if needed)
 // ========================================
 
-app.post("/api/support/:conversationId/end-session", async (req, res) => {
+// ========================================
+// SHARED HELPER — LOOK UP A SUPPORT TICKET
+// AND ITS ORIGINAL REQUESTER
+// ========================================
+
+async function getSupportTicketAndRequester(conversationId) {
+
+    const conversationResult = await pool.query(
+        `SELECT * FROM conversations WHERE id = $1 AND type = 'SUPPORT' LIMIT 1`,
+        [conversationId]
+    );
+
+    if (conversationResult.rows.length === 0) {
+        return { conversation: null, requester: null };
+    }
+
+    const requesterResult = await pool.query(
+        `
+        SELECT student.id, student.first_name
+        FROM conversation_participants cp
+        JOIN students AS student ON student.id = cp.student_id AND student.is_support = false
+        WHERE cp.conversation_id = $1
+        LIMIT 1
+        `,
+        [conversationId]
+    );
+
+    return {
+        conversation: conversationResult.rows[0],
+        requester: requesterResult.rows.length > 0 ? requesterResult.rows[0] : null
+    };
+
+}
+
+
+// ========================================
+// RESOLVE A TICKET
+// (issue addressed, but stays associated
+// with the same staffer — a lighter state
+// than fully closing it)
+// ========================================
+
+app.post("/api/support/:conversationId/resolve", async (req, res) => {
 
     try {
 
@@ -10872,12 +11186,10 @@ app.post("/api/support/:conversationId/end-session", async (req, res) => {
 
         }
 
-        const conversationResult = await pool.query(
-            `SELECT * FROM conversations WHERE id = $1 AND type = 'SUPPORT' LIMIT 1`,
-            [conversationId]
-        );
+        const { conversation, requester } =
+            await getSupportTicketAndRequester(conversationId);
 
-        if (conversationResult.rows.length === 0) {
+        if (!conversation) {
 
             return res.status(404).json({
                 success: false,
@@ -10886,14 +11198,95 @@ app.post("/api/support/:conversationId/end-session", async (req, res) => {
 
         }
 
-        const conversation =
-            conversationResult.rows[0];
+        if (String(conversation.claimed_by) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only the staff member handling this ticket can resolve it."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE conversations SET support_status = 'resolved', resolved_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [conversationId]
+        );
+
+        if (requester) {
+
+            await sendKSupportAutoMessage(
+                conversationId,
+                requester.id,
+                KSUPPORT_TEMPLATES.resolved(
+                    conversation.ticket_number || "your ticket",
+                    requester.first_name || "there"
+                )
+            );
+
+        }
+
+        res.status(200).json({
+            success: true,
+            message: "Ticket marked as resolved."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Resolve ticket error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not resolve this ticket."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CLOSE A TICKET
+// (final state — a student contacting
+// support again after this gets a brand
+// new ticket)
+// ========================================
+
+app.post("/api/support/:conversationId/close", async (req, res) => {
+
+    try {
+
+        const { conversationId } = req.params;
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const { conversation, requester } =
+            await getSupportTicketAndRequester(conversationId);
+
+        if (!conversation) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Support conversation not found."
+            });
+
+        }
 
         if (String(conversation.claimed_by) !== String(studentId)) {
 
             return res.status(403).json({
                 success: false,
-                message: "Only the staff member handling this conversation can end the session."
+                message: "Only the staff member handling this ticket can close it."
             });
 
         }
@@ -10903,21 +11296,146 @@ app.post("/api/support/:conversationId/end-session", async (req, res) => {
             [conversationId]
         );
 
+        if (requester) {
+
+            await sendKSupportAutoMessage(
+                conversationId,
+                requester.id,
+                KSUPPORT_TEMPLATES.closed(
+                    conversation.ticket_number || "your ticket",
+                    requester.first_name || "there"
+                )
+            );
+
+        }
+
         res.status(200).json({
             success: true,
-            message: "Support session ended."
+            message: "Ticket closed."
         });
 
     } catch (error) {
 
         console.error(
-            "End support session error:",
+            "Close ticket error:",
             error.message
         );
 
         res.status(500).json({
             success: false,
-            message: "Could not end this session."
+            message: "Could not close this ticket."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// REOPEN A TICKET
+// (any support staffer can reopen a closed
+// or resolved ticket — reopening claims it
+// for whoever does it)
+// ========================================
+
+app.post("/api/support/:conversationId/reopen", async (req, res) => {
+
+    try {
+
+        const { conversationId } = req.params;
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const staffCheck = await pool.query(
+            `SELECT is_support FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (staffCheck.rows.length === 0 || !staffCheck.rows[0].is_support) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only KSupport staff can reopen a ticket."
+            });
+
+        }
+
+        const { conversation, requester } =
+            await getSupportTicketAndRequester(conversationId);
+
+        if (!conversation) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Support conversation not found."
+            });
+
+        }
+
+        if (conversation.support_status !== "closed" && conversation.support_status !== "resolved") {
+
+            return res.status(400).json({
+                success: false,
+                message: "Only a resolved or closed ticket can be reopened."
+            });
+
+        }
+
+        await pool.query(
+            `
+            UPDATE conversations
+            SET support_status = 'claimed', claimed_by = $1, claimed_at = CURRENT_TIMESTAMP, resolved_at = NULL
+            WHERE id = $2
+            `,
+            [studentId, conversationId]
+        );
+
+        await pool.query(
+            `
+            INSERT INTO conversation_participants (conversation_id, student_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+            `,
+            [conversationId, studentId]
+        );
+
+        if (requester) {
+
+            await sendKSupportAutoMessage(
+                conversationId,
+                requester.id,
+                KSUPPORT_TEMPLATES.reopened(
+                    conversation.ticket_number || "your ticket",
+                    requester.first_name || "there"
+                )
+            );
+
+        }
+
+        res.status(200).json({
+            success: true,
+            message: "Ticket reopened.",
+            conversationId: Number(conversationId)
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Reopen ticket error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not reopen this ticket."
         });
 
     }
