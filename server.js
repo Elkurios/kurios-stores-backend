@@ -4861,6 +4861,8 @@ app.get("/api/orders", async (req, res) => {
             SELECT
                 id,
                 payment_reference,
+                transaction_reference,
+                payment_gateway,
                 items,
                 amount,
                 status,
@@ -4887,6 +4889,205 @@ app.get("/api/orders", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Could not load your orders."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// DELETE AN ORDER
+// (only failed orders — never paid ones)
+// ========================================
+
+app.delete("/api/orders/:id", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const orderResult = await pool.query(
+            `SELECT * FROM orders WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (orderResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Order not found."
+            });
+
+        }
+
+        const order = orderResult.rows[0];
+
+        if (String(order.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your order."
+            });
+
+        }
+
+        if (order.status !== "failed") {
+
+            return res.status(400).json({
+                success: false,
+                message: "Only failed orders can be deleted."
+            });
+
+        }
+
+        await pool.query(
+            `DELETE FROM orders WHERE id = $1`,
+            [id]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Order deleted."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Delete order error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not delete this order."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// EDIT A PENDING ORDER
+// (change item quantities, or remove
+// items — only while still pending)
+// ========================================
+
+app.patch("/api/orders/:id", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId, items } = req.body;
+
+        if (!studentId || !Array.isArray(items) || items.length === 0) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId or items."
+            });
+
+        }
+
+        const orderResult = await pool.query(
+            `SELECT * FROM orders WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (orderResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Order not found."
+            });
+
+        }
+
+        const order = orderResult.rows[0];
+
+        if (String(order.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your order."
+            });
+
+        }
+
+        if (order.status !== "pending") {
+
+            return res.status(400).json({
+                success: false,
+                message: "Only pending orders can be edited."
+            });
+
+        }
+
+        let totalAmount;
+        let trustedItems;
+
+        try {
+
+            const built =
+                await buildTrustedOrderItems(items);
+
+            totalAmount = built.totalAmount;
+            trustedItems = built.trustedItems;
+
+        } catch (buildError) {
+
+            return res.status(400).json({
+                success: false,
+                message: buildError.message
+            });
+
+        }
+
+        if (!totalAmount || isNaN(totalAmount) || totalAmount <= 0) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Order total must be greater than zero."
+            });
+
+        }
+
+        const updateResult = await pool.query(
+            `
+            UPDATE orders
+            SET items = $1, amount = $2, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $3
+            RETURNING *
+            `,
+            [JSON.stringify(trustedItems), totalAmount, id]
+        );
+
+        res.status(200).json({
+            success: true,
+            order: updateResult.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Edit order error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not update this order."
         });
 
     }
