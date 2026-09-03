@@ -11444,6 +11444,102 @@ app.post("/api/support/:conversationId/reopen", async (req, res) => {
 
 
 // ========================================
+// TRANSFER A TICKET
+// (only the current claimant can transfer —
+// releases it back to the open pool for
+// another staffer to pick up)
+// ========================================
+
+app.post("/api/support/:conversationId/transfer", async (req, res) => {
+
+    try {
+
+        const { conversationId } = req.params;
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const { conversation, requester } =
+            await getSupportTicketAndRequester(conversationId);
+
+        if (!conversation) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Support conversation not found."
+            });
+
+        }
+
+        if (String(conversation.claimed_by) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only the staff member currently handling this ticket can transfer it."
+            });
+
+        }
+
+        await pool.query(
+            `
+            UPDATE conversations
+            SET support_status = 'open', claimed_by = NULL, claimed_at = NULL
+            WHERE id = $1
+            `,
+            [conversationId]
+        );
+
+        await pool.query(
+            `
+            DELETE FROM conversation_participants
+            WHERE conversation_id = $1 AND student_id = $2
+            `,
+            [conversationId, studentId]
+        );
+
+        if (requester) {
+
+            await sendKSupportAutoMessage(
+                conversationId,
+                requester.id,
+                KSUPPORT_TEMPLATES.transferred(
+                    conversation.ticket_number || "your ticket",
+                    requester.first_name || "there"
+                )
+            );
+
+        }
+
+        res.status(200).json({
+            success: true,
+            message: "Ticket transferred back to the support pool."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Transfer ticket error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not transfer this ticket."
+        });
+
+    }
+
+});
+
+
+// ========================================
 // CHAT — CONTACT SELLER ABOUT A PRODUCT
 // ========================================
 
