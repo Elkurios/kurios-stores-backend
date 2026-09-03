@@ -10328,6 +10328,63 @@ app.post("/api/chat/find", async (req, res) => {
 
 
 // ========================================
+// SEARCH FOR STUDENTS BY NAME
+// (returns multiple matches, unlike the
+// phone lookup above which is exact/unique)
+// ========================================
+
+app.get("/api/chat/search-students", async (req, res) => {
+
+    try {
+
+        const { studentId, query } = req.query;
+
+        if (!studentId || !query || query.trim().length < 2) {
+
+            return res.status(200).json({
+                success: true,
+                students: []
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT id, first_name, last_name, profile_picture, university
+            FROM students
+            WHERE
+                (first_name ILIKE $1 OR last_name ILIKE $1 OR (first_name || ' ' || last_name) ILIKE $1)
+                AND id != $2
+                AND is_support = false
+            ORDER BY first_name ASC
+            LIMIT 10
+            `,
+            ["%" + query.trim() + "%", studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            students: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Search students error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not search for students."
+        });
+
+    }
+
+});
+
+
+// ========================================
 // CHAT — LIST MY CONVERSATIONS
 // ========================================
 
