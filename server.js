@@ -2008,6 +2008,42 @@ async function ensureReviewsTableExists() {
 
 
 // ========================================
+// WISHLIST
+// ========================================
+
+async function ensureWishlistTableExists() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS wishlist_items (
+                id SERIAL PRIMARY KEY,
+                student_id INTEGER REFERENCES students(id),
+                product_id INTEGER REFERENCES products(id),
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (student_id, product_id)
+            )
+            `
+        );
+
+        console.log(
+            "Wishlist table is ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not create wishlist table:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
 // RUN ALL MIGRATIONS, IN ORDER
 // ========================================
 
@@ -2037,6 +2073,7 @@ async function runMigrations() {
     await ensureKSupportSystemAccount();
     await ensureWalletTransactionsTableExists();
     await ensureReviewsTableExists();
+    await ensureWishlistTableExists();
 
 }
 
@@ -2101,8 +2138,170 @@ app.get("/api/products", async (req, res) => {
 
 
 // ========================================
-// STUDENT REGISTRATION
+// WISHLIST
 // ========================================
+
+app.post("/api/wishlist/toggle", async (req, res) => {
+
+    try {
+
+        const { studentId, productId } = req.body;
+
+        if (!studentId || !productId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId or productId."
+            });
+
+        }
+
+        const existing = await pool.query(
+            `SELECT id FROM wishlist_items WHERE student_id = $1 AND product_id = $2 LIMIT 1`,
+            [studentId, productId]
+        );
+
+        if (existing.rows.length > 0) {
+
+            await pool.query(
+                `DELETE FROM wishlist_items WHERE id = $1`,
+                [existing.rows[0].id]
+            );
+
+            return res.status(200).json({
+                success: true,
+                inWishlist: false
+            });
+
+        }
+
+        await pool.query(
+            `INSERT INTO wishlist_items (student_id, product_id) VALUES ($1, $2)`,
+            [studentId, productId]
+        );
+
+        res.status(200).json({
+            success: true,
+            inWishlist: true
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Toggle wishlist error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not update your wishlist."
+        });
+
+    }
+
+});
+
+app.get("/api/wishlist", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT
+                wishlist_items.id AS wishlist_item_id,
+                wishlist_items.created_at AS wishlisted_at,
+                products.*,
+                sellers.store_name AS seller_store_name,
+                (
+                    SELECT ROUND(AVG(rating), 1) FROM reviews WHERE product_id = products.id
+                ) AS avg_rating,
+                (
+                    SELECT COUNT(*) FROM reviews WHERE product_id = products.id
+                ) AS review_count
+            FROM wishlist_items
+            JOIN products ON products.id = wishlist_items.product_id
+            LEFT JOIN sellers ON sellers.id = products.seller_id
+            WHERE wishlist_items.student_id = $1
+            ORDER BY wishlist_items.created_at DESC
+            `,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            items: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch wishlist error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your wishlist."
+        });
+
+    }
+
+});
+
+app.get("/api/wishlist/ids", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const result = await pool.query(
+            `SELECT product_id FROM wishlist_items WHERE student_id = $1`,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            productIds: result.rows.map(function (r) { return r.product_id; })
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch wishlist ids error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your wishlist."
+        });
+
+    }
+
+});
+
+
+
 
 app.post("/api/students/register", async (req, res) => {
 
