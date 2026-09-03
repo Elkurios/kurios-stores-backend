@@ -1517,6 +1517,27 @@ async function ensureConversationsSchemaExists() {
 
         await pool.query(
             `
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS support_status TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS claimed_by INTEGER REFERENCES students(id)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP
+            `
+        );
+
+        await pool.query(
+            `
             CREATE TABLE IF NOT EXISTS message_reactions (
                 id SERIAL PRIMARY KEY,
                 message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
@@ -3109,7 +3130,8 @@ app.post("/api/students/login", async (req, res) => {
                 profile_picture,
                 password_hash,
                 email_verified,
-                is_suspended
+                is_suspended,
+                is_support
             FROM students
             WHERE
                 LOWER(email) = LOWER($1)
@@ -9168,12 +9190,37 @@ app.get("/api/chat/conversations", async (req, res) => {
                 conversations.type,
                 conversations.context_id,
                 partner.id,
-                partner.first_name,
-                partner.last_name,
-                partner.profile_picture,
+                CASE
+                    WHEN conversations.type = 'SUPPORT'
+                    AND conversations.claimed_by IS DISTINCT FROM $1
+                    THEN 'Elkurios'
+                    ELSE partner.first_name
+                END AS first_name,
+                CASE
+                    WHEN conversations.type = 'SUPPORT'
+                    AND conversations.claimed_by IS DISTINCT FROM $1
+                    THEN ''
+                    ELSE partner.last_name
+                END AS last_name,
+                CASE
+                    WHEN conversations.type = 'SUPPORT'
+                    AND conversations.claimed_by IS DISTINCT FROM $1
+                    THEN NULL
+                    ELSE partner.profile_picture
+                END AS profile_picture,
                 partner.university,
-                partner.phone,
-                partner.whatsapp_number,
+                CASE
+                    WHEN conversations.type = 'SUPPORT'
+                    AND conversations.claimed_by IS DISTINCT FROM $1
+                    THEN NULL
+                    ELSE partner.phone
+                END AS phone,
+                CASE
+                    WHEN conversations.type = 'SUPPORT'
+                    AND conversations.claimed_by IS DISTINCT FROM $1
+                    THEN NULL
+                    ELSE partner.whatsapp_number
+                END AS whatsapp_number,
                 partner_seller.store_name AS partner_store_name,
                 product.name AS product_name,
                 latest.body AS last_message,
@@ -9205,6 +9252,7 @@ app.get("/api/chat/conversations", async (req, res) => {
             LEFT JOIN sellers AS partner_seller
                 ON partner_seller.student_id = partner.id
                 AND partner_seller.status = 'approved'
+                AND conversations.type != 'SUPPORT'
             WHERE my_cp.student_id = $1
             ORDER BY latest.created_at DESC
             `,
@@ -9497,9 +9545,11 @@ app.post("/api/chat/messages", async (req, res) => {
 
     try {
 
-        const { senderId, recipientId, body, conversationId: requestedConversationId } = req.body;
+        const { senderId, body, conversationId: requestedConversationId } = req.body;
 
-        if (!senderId || !recipientId || !body || !body.trim()) {
+        let { recipientId } = req.body;
+
+        if (!senderId || !body || !body.trim()) {
 
             return res.status(400).json({
                 success: false,
@@ -9508,34 +9558,99 @@ app.post("/api/chat/messages", async (req, res) => {
 
         }
 
-        const recipientCheck = await pool.query(
-            `SELECT id FROM students WHERE id = $1 LIMIT 1`,
-            [recipientId]
-        );
+        if (!recipientId && !requestedConversationId) {
 
-        if (recipientCheck.rows.length === 0) {
-
-            return res.status(404).json({
+            return res.status(400).json({
                 success: false,
-                message: "That student could not be found."
+                message: "Missing recipientId or conversationId."
             });
 
         }
 
-        const resolved =
-            await resolveConversationForSend(senderId, recipientId, requestedConversationId);
+        if (recipientId) {
 
-        if (resolved.error) {
+            const recipientCheck = await pool.query(
+                `SELECT id FROM students WHERE id = $1 LIMIT 1`,
+                [recipientId]
+            );
 
-            return res.status(403).json({
-                success: false,
-                message: resolved.error
-            });
+            if (recipientCheck.rows.length === 0) {
+
+                return res.status(404).json({
+                    success: false,
+                    message: "That student could not be found."
+                });
+
+            }
 
         }
 
-        const conversationId =
-            resolved.conversationId;
+        let conversationId;
+
+        if (requestedConversationId) {
+
+            // Sending into a specific conversation — confirm
+            // real membership, then find who else (if anyone
+            // yet) is actually in it. An unclaimed support
+            // conversation may have no one else yet — that's
+            // fine, the message still saves and will be
+            // visible once a staffer picks it up.
+
+            const membershipCheck = await pool.query(
+                `
+                SELECT 1 FROM conversation_participants
+                WHERE conversation_id = $1 AND student_id = $2
+                LIMIT 1
+                `,
+                [requestedConversationId, senderId]
+            );
+
+            if (membershipCheck.rows.length === 0) {
+
+                return res.status(403).json({
+                    success: false,
+                    message: "You don't have access to this conversation."
+                });
+
+            }
+
+            conversationId = requestedConversationId;
+
+            if (!recipientId) {
+
+                const otherParticipant = await pool.query(
+                    `
+                    SELECT student_id FROM conversation_participants
+                    WHERE conversation_id = $1 AND student_id != $2
+                    LIMIT 1
+                    `,
+                    [conversationId, senderId]
+                );
+
+                recipientId =
+                    otherParticipant.rows.length > 0 ?
+                        otherParticipant.rows[0].student_id :
+                        null;
+
+            }
+
+        } else {
+
+            const resolved =
+                await resolveConversationForSend(senderId, recipientId, null);
+
+            if (resolved.error) {
+
+                return res.status(403).json({
+                    success: false,
+                    message: resolved.error
+                });
+
+            }
+
+            conversationId = resolved.conversationId;
+
+        }
 
         const result = await pool.query(
             `
@@ -9558,9 +9673,11 @@ app.post("/api/chat/messages", async (req, res) => {
         // Deliver in real time if the recipient is
         // connected — the recipient's own poll/fetch
         // remains the source of truth either way, this
-        // is purely for instant delivery.
+        // is purely for instant delivery. If there's no
+        // recipient yet (unclaimed support ticket), there's
+        // simply no one to notify yet.
 
-        if (typeof io !== "undefined") {
+        if (typeof io !== "undefined" && recipientId) {
 
             io.to("student:" + recipientId).emit(
                 "new_message",
@@ -10461,44 +10578,54 @@ app.post("/api/chat/contact-support", async (req, res) => {
 
         }
 
-        // Pick the support staff member currently handling
-        // the fewest open support conversations, so requests
-        // spread out rather than piling on one person.
+        // If this student already has an open (unclaimed)
+        // or claimed (actively being handled) support
+        // conversation, reuse it rather than starting a
+        // new one. Only start fresh once a previous one
+        // has been closed out.
 
-        const supportStaffResult = await pool.query(
+        const existing = await pool.query(
             `
-            SELECT
-                students.id,
-                students.first_name,
-                students.last_name,
-                (
-                    SELECT COUNT(*)::int
-                    FROM conversation_participants cp
-                    JOIN conversations c ON c.id = cp.conversation_id
-                    WHERE cp.student_id = students.id
-                    AND c.type = 'SUPPORT'
-                ) AS open_support_chats
-            FROM students
-            WHERE students.is_support = true
-            ORDER BY open_support_chats ASC, students.id ASC
+            SELECT conversations.id
+            FROM conversations
+            JOIN conversation_participants cp ON cp.conversation_id = conversations.id
+            WHERE conversations.type = 'SUPPORT'
+            AND cp.student_id = $1
+            AND conversations.support_status IN ('open', 'claimed')
+            ORDER BY conversations.id DESC
             LIMIT 1
-            `
+            `,
+            [studentId]
         );
 
-        if (supportStaffResult.rows.length === 0) {
+        let conversationId;
 
-            return res.status(503).json({
-                success: false,
-                message: "Kurios Stores Support isn't available right now — please try again shortly."
-            });
+        if (existing.rows.length > 0) {
+
+            conversationId = existing.rows[0].id;
+
+        } else {
+
+            const created = await pool.query(
+                `
+                INSERT INTO conversations (type, support_status)
+                VALUES ('SUPPORT', 'open')
+                RETURNING id
+                `
+            );
+
+            conversationId = created.rows[0].id;
+
+            await pool.query(
+                `
+                INSERT INTO conversation_participants (conversation_id, student_id)
+                VALUES ($1, $2)
+                ON CONFLICT DO NOTHING
+                `,
+                [conversationId, studentId]
+            );
 
         }
-
-        const supportStaff =
-            supportStaffResult.rows[0];
-
-        const conversationId =
-            await findOrCreateConversation(studentId, supportStaff.id, "SUPPORT", null);
 
         res.status(200).json({
 
@@ -10506,10 +10633,13 @@ app.post("/api/chat/contact-support", async (req, res) => {
 
             conversationId: conversationId,
 
-            supportStudentId: supportStaff.id,
+            // The student never sees a real staffer's
+            // identity — support always answers as Elkurios,
+            // whether or not anyone has picked it up yet.
 
-            supportName:
-                [supportStaff.first_name, supportStaff.last_name].filter(Boolean).join(" ") || "Kurios Stores Support"
+            supportStudentId: null,
+
+            supportName: "Elkurios"
 
         });
 
@@ -10523,6 +10653,271 @@ app.post("/api/chat/contact-support", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Could not start a conversation with support."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// SUPPORT POOL — unclaimed conversations
+// any support staffer can see and pick up
+// ========================================
+
+app.get("/api/support/pool", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const staffCheck = await pool.query(
+            `SELECT is_support FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (staffCheck.rows.length === 0 || !staffCheck.rows[0].is_support) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only KSupport staff can view the support pool."
+            });
+
+        }
+
+        const poolResult = await pool.query(
+            `
+            SELECT
+                conversations.id AS conversation_id,
+                conversations.created_at,
+                student.id AS student_id,
+                student.first_name,
+                student.last_name,
+                student.university,
+                latest.body AS last_message,
+                latest.created_at AS last_message_at
+            FROM conversations
+            JOIN conversation_participants cp ON cp.conversation_id = conversations.id
+            JOIN students AS student ON student.id = cp.student_id
+            LEFT JOIN LATERAL (
+                SELECT body, created_at
+                FROM messages
+                WHERE conversation_id = conversations.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) AS latest ON true
+            WHERE conversations.type = 'SUPPORT'
+            AND conversations.support_status = 'open'
+            ORDER BY conversations.created_at ASC
+            `
+        );
+
+        res.status(200).json({
+            success: true,
+            pool: poolResult.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch support pool error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load the support pool."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CLAIM A SUPPORT CONVERSATION
+// (exclusive — rejected if someone else
+// already has it)
+// ========================================
+
+app.post("/api/support/pool/:conversationId/claim", async (req, res) => {
+
+    try {
+
+        const { conversationId } = req.params;
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const staffCheck = await pool.query(
+            `SELECT is_support FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (staffCheck.rows.length === 0 || !staffCheck.rows[0].is_support) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only KSupport staff can claim support conversations."
+            });
+
+        }
+
+        const conversationResult = await pool.query(
+            `SELECT * FROM conversations WHERE id = $1 AND type = 'SUPPORT' LIMIT 1`,
+            [conversationId]
+        );
+
+        if (conversationResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Support conversation not found."
+            });
+
+        }
+
+        const conversation =
+            conversationResult.rows[0];
+
+        if (conversation.support_status !== "open") {
+
+            return res.status(409).json({
+                success: false,
+                message:
+                    conversation.support_status === "claimed" ?
+                        "Someone else has already picked this up." :
+                        "This conversation has already been closed."
+            });
+
+        }
+
+        await pool.query(
+            `
+            UPDATE conversations
+            SET support_status = 'claimed', claimed_by = $1, claimed_at = CURRENT_TIMESTAMP
+            WHERE id = $2
+            `,
+            [studentId, conversationId]
+        );
+
+        await pool.query(
+            `
+            INSERT INTO conversation_participants (conversation_id, student_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+            `,
+            [conversationId, studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Conversation claimed.",
+            conversationId: Number(conversationId)
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Claim support conversation error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not claim this conversation."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// END A SUPPORT SESSION
+// (only the staffer who claimed it can end
+// it — this frees the student up to start a
+// fresh support request later if needed)
+// ========================================
+
+app.post("/api/support/:conversationId/end-session", async (req, res) => {
+
+    try {
+
+        const { conversationId } = req.params;
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const conversationResult = await pool.query(
+            `SELECT * FROM conversations WHERE id = $1 AND type = 'SUPPORT' LIMIT 1`,
+            [conversationId]
+        );
+
+        if (conversationResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Support conversation not found."
+            });
+
+        }
+
+        const conversation =
+            conversationResult.rows[0];
+
+        if (String(conversation.claimed_by) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only the staff member handling this conversation can end the session."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE conversations SET support_status = 'closed' WHERE id = $1`,
+            [conversationId]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Support session ended."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "End support session error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not end this session."
         });
 
     }
