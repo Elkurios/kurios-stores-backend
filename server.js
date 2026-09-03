@@ -1787,7 +1787,25 @@ function generateTicketNumber() {
 async function sendKSupportAutoMessage(conversationId, recipientId, body) {
 
     if (!ksupportSystemAccountId) {
-        return;
+
+        // Shouldn't happen now that the server waits for
+        // migrations before accepting requests — but if it
+        // ever does, try once more and log it clearly rather
+        // than silently dropping the automated message.
+
+        await ensureKSupportSystemAccount();
+
+        if (!ksupportSystemAccountId) {
+
+            console.error(
+                "sendKSupportAutoMessage: KSupport system account is still not available — automated message was not sent for conversation " +
+                conversationId
+            );
+
+            return;
+
+        }
+
     }
 
     try {
@@ -1982,8 +2000,6 @@ async function runMigrations() {
     await ensureReviewsTableExists();
 
 }
-
-runMigrations();
 
 
 // ========================================
@@ -11649,7 +11665,25 @@ app.post("/api/chat/contact-seller", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-httpServer.listen(PORT, () => {
-    console.log(`Kurios Stores server is running on port ${PORT}`);
-    console.log("Real-time chat (Socket.IO) is ready.");
-});
+runMigrations()
+    .then(() => {
+
+        httpServer.listen(PORT, () => {
+            console.log(`Kurios Stores server is running on port ${PORT}`);
+            console.log("Real-time chat (Socket.IO) is ready.");
+        });
+
+    })
+    .catch((error) => {
+
+        console.error(
+            "Startup migrations failed — starting the server anyway so the site doesn't go fully dark, but some features may not work correctly until this is resolved:",
+            error.message
+        );
+
+        httpServer.listen(PORT, () => {
+            console.log(`Kurios Stores server is running on port ${PORT}`);
+            console.log("Real-time chat (Socket.IO) is ready.");
+        });
+
+    });
