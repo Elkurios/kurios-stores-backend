@@ -735,8 +735,15 @@ async function ensureProfileColumnsExist() {
             `
         );
 
+        await pool.query(
+            `
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS passcode_history JSONB DEFAULT '[]'::jsonb
+            `
+        );
+
         console.log(
-            "Profile columns (date_of_birth, profile_picture, is_suspended, is_support) are ready."
+            "Profile columns (date_of_birth, profile_picture, is_suspended, is_support, passcode_history) are ready."
         );
 
     } catch (error) {
@@ -3402,22 +3409,69 @@ app.post("/api/students/reset-passcode", async (req, res) => {
 
         // ====================================
         // SET NEW PASSCODE
+        // (can't reuse the current passcode or
+        // any of the last 4 previous ones)
         // ====================================
+
+        const currentStudentResult = await pool.query(
+            `SELECT password_hash, passcode_history FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (currentStudentResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Student account could not be found."
+            });
+
+        }
+
+        const currentPasswordHash =
+            currentStudentResult.rows[0].password_hash;
+
+        const passcodeHistory =
+            currentStudentResult.rows[0].passcode_history || [];
+
+        const hashesToCheck =
+            [currentPasswordHash, ...passcodeHistory].filter(Boolean);
+
+        for (const oldHash of hashesToCheck) {
+
+            const matchesOldPasscode =
+                await bcrypt.compare(newPasscode, oldHash);
+
+            if (matchesOldPasscode) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "You can't reuse a recent passcode. Please choose one you haven't used in your last 4 passcodes."
+                });
+
+            }
+
+        }
 
         const passwordHash =
             await bcrypt.hash(newPasscode, 12);
+
+        const updatedHistory =
+            [currentPasswordHash, ...passcodeHistory]
+                .filter(Boolean)
+                .slice(0, 4);
 
         const updatedStudent = await pool.query(
             `
             UPDATE students
             SET
                 password_hash = $1,
+                passcode_history = $2,
                 email_verified = true,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = $2
+            WHERE id = $3
             RETURNING id, email
             `,
-            [passwordHash, studentId]
+            [passwordHash, JSON.stringify(updatedHistory), studentId]
         );
 
         if (updatedStudent.rows.length === 0) {
