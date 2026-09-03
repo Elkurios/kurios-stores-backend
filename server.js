@@ -834,8 +834,31 @@ async function ensureProfileColumnsExist() {
             `
         );
 
+        await pool.query(
+            `
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS wallet_balance NUMERIC(12, 2) DEFAULT 0
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS wallet_topups (
+                id SERIAL PRIMARY KEY,
+                student_id INTEGER REFERENCES students(id),
+                payment_reference TEXT UNIQUE NOT NULL,
+                transaction_reference TEXT,
+                amount NUMERIC(12, 2) NOT NULL,
+                payment_gateway TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
         console.log(
-            "Profile columns (date_of_birth, profile_picture, is_suspended, is_support, passcode_history) are ready."
+            "Profile columns (date_of_birth, profile_picture, is_suspended, is_support, passcode_history, wallet_balance) are ready."
         );
 
     } catch (error) {
@@ -4648,6 +4671,31 @@ app.post("/api/orders/verify", async (req, res) => {
 
 
 // ========================================
+// ROUTE A WEBHOOK PAYMENT REFERENCE TO THE
+// RIGHT VERIFIER (order / seller fee / wallet
+// top-up) — shared by all three gateways
+// ========================================
+
+async function routeWebhookVerification(paymentReference) {
+
+    if (paymentReference.startsWith("kurios_seller_")) {
+
+        return await verifyAndUpdateSellerPayment(paymentReference);
+
+    }
+
+    if (paymentReference.startsWith("kurios_topup_")) {
+
+        return await verifyAndUpdateWalletTopup(paymentReference);
+
+    }
+
+    return await verifyAndUpdateOrder(paymentReference);
+
+}
+
+
+// ========================================
 // MONNIFY WEBHOOK
 // (catches payments even if the student
 // closes the browser before we can verify)
@@ -4671,19 +4719,7 @@ app.post("/api/orders/webhook", async (req, res) => {
 
         }
 
-        if (paymentReference.startsWith("kurios_seller_")) {
-
-            await verifyAndUpdateSellerPayment(
-                paymentReference
-            );
-
-        } else {
-
-            await verifyAndUpdateOrder(
-                paymentReference
-            );
-
-        }
+        await routeWebhookVerification(paymentReference);
 
         res.status(200).send("ok");
 
@@ -4729,19 +4765,7 @@ app.post("/api/opay/webhook", async (req, res) => {
 
         }
 
-        if (paymentReference.startsWith("kurios_seller_")) {
-
-            await verifyAndUpdateSellerPayment(
-                paymentReference
-            );
-
-        } else {
-
-            await verifyAndUpdateOrder(
-                paymentReference
-            );
-
-        }
+        await routeWebhookVerification(paymentReference);
 
         res.status(200).send("ok");
 
@@ -4780,19 +4804,7 @@ app.post("/api/paystack/webhook", async (req, res) => {
 
         }
 
-        if (paymentReference.startsWith("kurios_seller_")) {
-
-            await verifyAndUpdateSellerPayment(
-                paymentReference
-            );
-
-        } else {
-
-            await verifyAndUpdateOrder(
-                paymentReference
-            );
-
-        }
+        await routeWebhookVerification(paymentReference);
 
         res.status(200).send("ok");
 
@@ -6692,6 +6704,558 @@ app.get("/api/sellers/orders", async (req, res) => {
 // ========================================
 // SELLER WALLET — BALANCE + TRANSACTIONS
 // ========================================
+
+// ========================================
+// STUDENT'S OWN WALLET
+// (personal balance — only increases via a
+// real top-up, never from selling products)
+// ========================================
+
+app.get("/api/students/wallet", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const studentResult = await pool.query(
+            `SELECT wallet_balance FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (studentResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Student not found."
+            });
+
+        }
+
+        const topupsResult = await pool.query(
+            `
+            SELECT *
+            FROM wallet_topups
+            WHERE student_id = $1
+            ORDER BY created_at DESC
+            LIMIT 50
+            `,
+            [studentId]
+        );
+
+        res.status(200).json({
+
+            success: true,
+
+            balance: Number(studentResult.rows[0].wallet_balance || 0),
+
+            topups: topupsResult.rows
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch student wallet error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your wallet."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// START A WALLET TOP-UP
+// ========================================
+
+app.post("/api/wallet/topup/initiate", async (req, res) => {
+
+    try {
+
+        const { studentId, amount } = req.body;
+
+        if (!studentId || !amount || isNaN(amount) || Number(amount) <= 0) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a valid amount to top up."
+            });
+
+        }
+
+        const paymentReference =
+            "kurios_topup_" +
+            Date.now() +
+            "_" +
+            crypto.randomInt(100000, 999999);
+
+        await pool.query(
+            `
+            INSERT INTO wallet_topups (student_id, payment_reference, amount, status)
+            VALUES ($1, $2, $3, 'pending')
+            `,
+            [studentId, paymentReference, Number(amount)]
+        );
+
+        res.status(200).json({
+
+            success: true,
+
+            paymentReference: paymentReference,
+
+            amount: Number(amount)
+
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Wallet topup initiate error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not start your top-up."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// GET GATEWAY CHECKOUT DETAILS FOR A
+// WALLET TOP-UP
+// ========================================
+
+app.post("/api/wallet/topup/pay/:gateway", async (req, res) => {
+
+    try {
+
+        const { gateway } = req.params;
+        const { paymentReference, returnUrl, customerName, customerEmail } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const topupResult = await pool.query(
+            `SELECT * FROM wallet_topups WHERE payment_reference = $1 LIMIT 1`,
+            [paymentReference]
+        );
+
+        if (topupResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Top-up not found."
+            });
+
+        }
+
+        const topup = topupResult.rows[0];
+
+        await pool.query(
+            `UPDATE wallet_topups SET payment_gateway = $1 WHERE id = $2`,
+            [gateway, topup.id]
+        );
+
+        if (gateway === "monnify") {
+
+            return res.status(200).json({
+                success: true,
+                paymentReference: paymentReference,
+                amount: Number(topup.amount),
+                apiKey: MONNIFY_API_KEY,
+                contractCode: MONNIFY_CONTRACT_CODE
+            });
+
+        }
+
+        if (gateway === "opay") {
+
+            const opayData =
+                await createOpayCashierPayment({
+                    reference: paymentReference,
+                    amountNaira: Number(topup.amount),
+                    customerName: customerName || "Kurios Student",
+                    customerEmail: customerEmail || "",
+                    description: "Kurios Stores wallet top-up",
+                    returnUrl: returnUrl,
+                    callbackUrl: OPAY_CALLBACK_URL
+                });
+
+            return res.status(200).json({
+                success: true,
+                cashierUrl: opayData.cashierUrl
+            });
+
+        }
+
+        if (gateway === "paystack") {
+
+            const paystackData =
+                await initializePaystackTransaction({
+                    reference: paymentReference,
+                    amountNaira: Number(topup.amount),
+                    email: customerEmail,
+                    callbackUrl: returnUrl
+                });
+
+            return res.status(200).json({
+                success: true,
+                authorizationUrl: paystackData.authorization_url
+            });
+
+        }
+
+        res.status(400).json({
+            success: false,
+            message: "Unknown payment gateway."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Wallet topup checkout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: error.message || "Could not start checkout."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// VERIFY & CREDIT A WALLET TOP-UP
+// (shared by the manual verify endpoint
+// and all three gateway webhooks)
+// ========================================
+
+async function verifyAndUpdateWalletTopup(paymentReference) {
+
+    const topupResult = await pool.query(
+        `SELECT * FROM wallet_topups WHERE payment_reference = $1 LIMIT 1`,
+        [paymentReference]
+    );
+
+    if (topupResult.rows.length === 0) {
+
+        return {
+            success: false,
+            message: "Top-up not found.",
+            topup: null
+        };
+
+    }
+
+    const topup =
+        topupResult.rows[0];
+
+    if (topup.status === "paid") {
+
+        return {
+            success: true,
+            message: "Top-up already confirmed.",
+            topup: topup
+        };
+
+    }
+
+    let isPaid = false;
+    let isFailed = false;
+    let transactionReference = null;
+
+    try {
+
+        if (topup.payment_gateway === "opay") {
+
+            const opayData =
+                await queryOpayPaymentStatus(paymentReference);
+
+            isPaid =
+                opayData.status === "SUCCESS" &&
+                Number(opayData.amount.total) >= Math.round(Number(topup.amount) * 100);
+
+            isFailed =
+                opayData.status === "FAIL" || opayData.status === "CLOSE";
+
+            transactionReference = opayData.orderNo;
+
+        } else if (topup.payment_gateway === "paystack") {
+
+            const paystackData =
+                await verifyPaystackTransaction(paymentReference);
+
+            isPaid =
+                paystackData.status === "success" &&
+                Number(paystackData.amount) >= Math.round(Number(topup.amount) * 100);
+
+            isFailed =
+                paystackData.status === "failed" || paystackData.status === "abandoned";
+
+            transactionReference = paystackData.id;
+
+        } else {
+
+            const accessToken =
+                await getMonnifyAccessToken();
+
+            const verifyResponse = await fetch(
+                MONNIFY_BASE_URL +
+                "/api/v2/merchant/transactions/query?paymentReference=" +
+                encodeURIComponent(paymentReference),
+                {
+                    headers: { "Authorization": "Bearer " + accessToken },
+                    signal: AbortSignal.timeout(15000)
+                }
+            );
+
+            const verifyData = await verifyResponse.json();
+
+            if (verifyData.requestSuccessful) {
+
+                const paymentStatus =
+                    verifyData.responseBody.paymentStatus;
+
+                const amountPaid =
+                    Number(verifyData.responseBody.amountPaid || 0);
+
+                isPaid =
+                    (paymentStatus === "PAID" || paymentStatus === "OVERPAID") &&
+                    amountPaid >= Number(topup.amount);
+
+                isFailed =
+                    paymentStatus === "FAILED" ||
+                    paymentStatus === "EXPIRED" ||
+                    paymentStatus === "REVERSED";
+
+                transactionReference = verifyData.responseBody.transactionReference;
+
+            }
+
+        }
+
+    } catch (error) {
+
+        return {
+            success: false,
+            message: "Could not verify this payment.",
+            topup: topup
+        };
+
+    }
+
+    const updatedTopup = await pool.query(
+        `
+        UPDATE wallet_topups
+        SET status = $1, transaction_reference = $2, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $3
+        RETURNING *
+        `,
+        [isPaid ? "paid" : (isFailed ? "failed" : "pending"), transactionReference, topup.id]
+    );
+
+    // Credit the wallet — guarded so this can never
+    // double-credit even if verify gets called twice.
+
+    if (isPaid) {
+
+        await pool.query(
+            `
+            UPDATE students
+            SET wallet_balance = COALESCE(wallet_balance, 0) + $1
+            WHERE id = $2
+            `,
+            [Number(topup.amount), topup.student_id]
+        );
+
+    }
+
+    return {
+        success: isPaid,
+        message: isPaid ? "Top-up confirmed." : "Payment not yet confirmed.",
+        topup: updatedTopup.rows[0]
+    };
+
+}
+
+app.post("/api/wallet/topup/verify", async (req, res) => {
+
+    try {
+
+        const { paymentReference } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const result =
+            await verifyAndUpdateWalletTopup(paymentReference);
+
+        if (!result.topup) {
+            return res.status(404).json(result);
+        }
+
+        res.status(200).json(result);
+
+    } catch (error) {
+
+        console.error(
+            "Wallet topup verify error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Something went wrong while verifying your top-up."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// PAY FOR AN ORDER DIRECTLY FROM WALLET
+// BALANCE (instant, no external gateway)
+// ========================================
+
+app.post("/api/orders/pay/wallet", async (req, res) => {
+
+    try {
+
+        const { paymentReference, studentId } = req.body;
+
+        if (!paymentReference || !studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference or studentId."
+            });
+
+        }
+
+        const orderResult = await pool.query(
+            `SELECT * FROM orders WHERE payment_reference = $1 LIMIT 1`,
+            [paymentReference]
+        );
+
+        if (orderResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Order not found."
+            });
+
+        }
+
+        const order = orderResult.rows[0];
+
+        if (String(order.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your order."
+            });
+
+        }
+
+        if (order.status === "paid") {
+
+            return res.status(200).json({
+                success: true,
+                message: "This order is already paid.",
+                order: order
+            });
+
+        }
+
+        const studentResult = await pool.query(
+            `SELECT wallet_balance FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        const currentBalance =
+            Number(studentResult.rows[0].wallet_balance || 0);
+
+        if (currentBalance < Number(order.amount)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Your wallet balance isn't enough to cover this order."
+            });
+
+        }
+
+        // Deduct first, then mark paid — both guarded
+        // inside a single flow so a repeated click can't
+        // double-deduct (order.status check above already
+        // protects against that on retry).
+
+        await pool.query(
+            `UPDATE students SET wallet_balance = wallet_balance - $1 WHERE id = $2`,
+            [Number(order.amount), studentId]
+        );
+
+        await pool.query(
+            `UPDATE orders SET payment_gateway = 'wallet' WHERE id = $1`,
+            [order.id]
+        );
+
+        const result =
+            await applyOrderPaymentResult(order, true, false, "wallet-" + order.payment_reference, "PAID");
+
+        res.status(200).json(result);
+
+    } catch (error) {
+
+        console.error(
+            "Pay order with wallet error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not complete this payment from your wallet."
+        });
+
+    }
+
+});
+
+
+
 
 app.get("/api/sellers/wallet", async (req, res) => {
 
