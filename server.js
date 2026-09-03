@@ -2044,6 +2044,56 @@ async function ensureWishlistTableExists() {
 
 
 // ========================================
+// BLOCK / REPORT
+// ========================================
+
+async function ensureBlockAndReportTablesExist() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS blocked_students (
+                id SERIAL PRIMARY KEY,
+                blocker_id INTEGER REFERENCES students(id),
+                blocked_id INTEGER REFERENCES students(id),
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (blocker_id, blocked_id)
+            )
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS reports (
+                id SERIAL PRIMARY KEY,
+                reporter_id INTEGER REFERENCES students(id),
+                reported_id INTEGER REFERENCES students(id),
+                reason TEXT NOT NULL,
+                details TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        console.log(
+            "Block and report tables are ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not create block/report tables:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
 // RUN ALL MIGRATIONS, IN ORDER
 // ========================================
 
@@ -2074,6 +2124,7 @@ async function runMigrations() {
     await ensureWalletTransactionsTableExists();
     await ensureReviewsTableExists();
     await ensureWishlistTableExists();
+    await ensureBlockAndReportTablesExist();
 
 }
 
@@ -2301,6 +2352,299 @@ app.get("/api/wishlist/ids", async (req, res) => {
 });
 
 
+// ========================================
+// BLOCK / UNBLOCK / REPORT
+// ========================================
+
+app.post("/api/students/block", async (req, res) => {
+
+    try {
+
+        const { studentId, blockedId } = req.body;
+
+        if (!studentId || !blockedId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId or blockedId."
+            });
+
+        }
+
+        if (String(studentId) === String(blockedId)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "You can't block yourself."
+            });
+
+        }
+
+        await pool.query(
+            `
+            INSERT INTO blocked_students (blocker_id, blocked_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+            `,
+            [studentId, blockedId]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Student blocked."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Block student error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not block this student."
+        });
+
+    }
+
+});
+
+app.post("/api/students/unblock", async (req, res) => {
+
+    try {
+
+        const { studentId, blockedId } = req.body;
+
+        if (!studentId || !blockedId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId or blockedId."
+            });
+
+        }
+
+        await pool.query(
+            `DELETE FROM blocked_students WHERE blocker_id = $1 AND blocked_id = $2`,
+            [studentId, blockedId]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Student unblocked."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Unblock student error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not unblock this student."
+        });
+
+    }
+
+});
+
+app.get("/api/students/blocked", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT
+                blocked_students.blocked_id,
+                students.first_name,
+                students.last_name,
+                blocked_students.created_at
+            FROM blocked_students
+            JOIN students ON students.id = blocked_students.blocked_id
+            WHERE blocked_students.blocker_id = $1
+            ORDER BY blocked_students.created_at DESC
+            `,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            blocked: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch blocked students error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your blocked list."
+        });
+
+    }
+
+});
+
+app.post("/api/students/report", async (req, res) => {
+
+    try {
+
+        const { studentId, reportedId, reason, details } = req.body;
+
+        if (!studentId || !reportedId || !reason) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please select a reason for your report."
+            });
+
+        }
+
+        if (String(studentId) === String(reportedId)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "You can't report yourself."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            INSERT INTO reports (reporter_id, reported_id, reason, details)
+            VALUES ($1, $2, $3, $4)
+            RETURNING *
+            `,
+            [studentId, reportedId, reason, details || null]
+        );
+
+        res.status(201).json({
+            success: true,
+            report: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Submit report error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not submit your report."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ADMIN — VIEW REPORTS
+// ========================================
+
+app.get("/api/admin/reports", requireAdminAuth, async (req, res) => {
+
+    try {
+
+        const { status } = req.query;
+
+        const result = await pool.query(
+            `
+            SELECT
+                reports.*,
+                reporter.first_name AS reporter_first_name,
+                reporter.last_name AS reporter_last_name,
+                reported.first_name AS reported_first_name,
+                reported.last_name AS reported_last_name
+            FROM reports
+            JOIN students AS reporter ON reporter.id = reports.reporter_id
+            JOIN students AS reported ON reported.id = reports.reported_id
+            ${status ? "WHERE reports.status = $1" : ""}
+            ORDER BY reports.created_at DESC
+            `,
+            status ? [status] : []
+        );
+
+        res.status(200).json({
+            success: true,
+            reports: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch admin reports error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load reports."
+        });
+
+    }
+
+});
+
+app.post("/api/admin/reports/:id/resolve", requireAdminAuth, async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+
+        const result = await pool.query(
+            `UPDATE reports SET status = 'reviewed' WHERE id = $1 RETURNING *`,
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Report not found."
+            });
+
+        }
+
+        res.status(200).json({
+            success: true,
+            report: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Resolve report error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not update this report."
+        });
+
+    }
+
+});
 
 
 app.post("/api/students/register", async (req, res) => {
@@ -10507,6 +10851,29 @@ app.post("/api/chat/messages", async (req, res) => {
             }
 
             conversationId = resolved.conversationId;
+
+        }
+
+        if (recipientId) {
+
+            const blockCheck = await pool.query(
+                `
+                SELECT 1 FROM blocked_students
+                WHERE (blocker_id = $1 AND blocked_id = $2)
+                OR (blocker_id = $2 AND blocked_id = $1)
+                LIMIT 1
+                `,
+                [senderId, recipientId]
+            );
+
+            if (blockCheck.rows.length > 0) {
+
+                return res.status(403).json({
+                    success: false,
+                    message: "This message could not be sent."
+                });
+
+            }
 
         }
 
