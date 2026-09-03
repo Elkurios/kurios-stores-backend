@@ -1168,6 +1168,45 @@ async function ensureSellerPaymentColumnsExist() {
             `
         );
 
+        await pool.query(
+            `
+            ALTER TABLE sellers
+            ADD COLUMN IF NOT EXISTS bank_name TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE sellers
+            ADD COLUMN IF NOT EXISTS bank_account_number TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE sellers
+            ADD COLUMN IF NOT EXISTS bank_account_name TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS payout_requests (
+                id SERIAL PRIMARY KEY,
+                seller_id INTEGER REFERENCES sellers(id),
+                amount NUMERIC(12, 2) NOT NULL,
+                bank_name TEXT NOT NULL,
+                bank_account_number TEXT NOT NULL,
+                bank_account_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                admin_note TEXT,
+                payout_reference TEXT,
+                requested_at TIMESTAMP DEFAULT NOW(),
+                processed_at TIMESTAMP
+            )
+            `
+        );
+
         console.log(
             "Seller payment columns are ready."
         );
@@ -6724,6 +6763,230 @@ app.post(
 
 
 // ========================================
+// ADMIN — PAYOUT REQUESTS
+// ========================================
+
+app.get("/api/admin/payouts", requireAdminAuth, async (req, res) => {
+
+    try {
+
+        const { status } = req.query;
+
+        const result = await pool.query(
+            `
+            SELECT
+                payout_requests.*,
+                sellers.store_name,
+                students.first_name,
+                students.last_name,
+                students.email
+            FROM payout_requests
+            JOIN sellers ON sellers.id = payout_requests.seller_id
+            JOIN students ON students.id = sellers.student_id
+            ${status ? "WHERE payout_requests.status = $1" : ""}
+            ORDER BY payout_requests.requested_at DESC
+            `,
+            status ? [status] : []
+        );
+
+        res.status(200).json({
+            success: true,
+            payouts: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch admin payouts error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load payout requests."
+        });
+
+    }
+
+});
+
+app.post("/api/admin/payouts/:id/approve", requireAdminAuth, async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+
+        const result = await pool.query(
+            `
+            UPDATE payout_requests
+            SET status = 'approved'
+            WHERE id = $1 AND status = 'pending'
+            RETURNING *
+            `,
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Payout request not found or already processed."
+            });
+
+        }
+
+        res.status(200).json({
+            success: true,
+            payout: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Approve payout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not approve this payout."
+        });
+
+    }
+
+});
+
+app.post("/api/admin/payouts/:id/mark-paid", requireAdminAuth, async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { payoutReference } = req.body;
+
+        const result = await pool.query(
+            `
+            UPDATE payout_requests
+            SET status = 'paid', payout_reference = $1, processed_at = CURRENT_TIMESTAMP
+            WHERE id = $2 AND status IN ('pending', 'approved')
+            RETURNING *
+            `,
+            [payoutReference || null, id]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Payout request not found or already processed."
+            });
+
+        }
+
+        const payout =
+            result.rows[0];
+
+        await pool.query(
+            `
+            INSERT INTO wallet_transactions (seller_id, type, amount, description)
+            VALUES ($1, 'payout_paid', 0, 'Payout of ' || $2 || ' completed')
+            `,
+            [payout.seller_id, payout.amount]
+        );
+
+        res.status(200).json({
+            success: true,
+            payout: payout
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Mark payout paid error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not mark this payout as paid."
+        });
+
+    }
+
+});
+
+app.post("/api/admin/payouts/:id/reject", requireAdminAuth, async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { adminNote } = req.body;
+
+        const payoutResult = await pool.query(
+            `SELECT * FROM payout_requests WHERE id = $1 AND status IN ('pending', 'approved') LIMIT 1`,
+            [id]
+        );
+
+        if (payoutResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Payout request not found or already processed."
+            });
+
+        }
+
+        const payout =
+            payoutResult.rows[0];
+
+        // Refund the escrowed amount back to the seller's
+        // wallet — this is exactly why the balance was
+        // deducted at request time, not at approval time.
+
+        await pool.query(
+            `UPDATE sellers SET wallet_balance = wallet_balance + $1 WHERE id = $2`,
+            [Number(payout.amount), payout.seller_id]
+        );
+
+        await pool.query(
+            `
+            UPDATE payout_requests
+            SET status = 'rejected', admin_note = $1, processed_at = CURRENT_TIMESTAMP
+            WHERE id = $2
+            `,
+            [adminNote || null, id]
+        );
+
+        await pool.query(
+            `
+            INSERT INTO wallet_transactions (seller_id, type, amount, description)
+            VALUES ($1, 'payout_rejected', $2, 'Payout request rejected — refunded')
+            `,
+            [payout.seller_id, Number(payout.amount)]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Payout rejected and refunded to seller's wallet."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Reject payout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not reject this payout."
+        });
+
+    }
+
+});
+
+
+// ========================================
 // SELLER PRODUCTS
 // ========================================
 
@@ -7518,6 +7781,182 @@ app.get("/api/sellers/wallet", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Could not load your wallet."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// REQUEST A PAYOUT
+// (deducts from wallet_balance immediately,
+// held in escrow until admin processes it —
+// refunded automatically if rejected)
+// ========================================
+
+app.post("/api/sellers/payout/request", async (req, res) => {
+
+    try {
+
+        const { studentId, amount, bankName, bankAccountNumber, bankAccountName } = req.body;
+
+        if (!studentId || !amount || isNaN(amount) || Number(amount) <= 0) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a valid amount to withdraw."
+            });
+
+        }
+
+        if (!bankName || !bankAccountNumber || !bankAccountName) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please provide your bank name, account number, and account name."
+            });
+
+        }
+
+        const seller =
+            await getApprovedSeller(studentId);
+
+        if (!seller) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only approved sellers can request a payout."
+            });
+
+        }
+
+        const currentBalance =
+            Number(seller.wallet_balance || 0);
+
+        if (Number(amount) > currentBalance) {
+
+            return res.status(400).json({
+                success: false,
+                message: "That's more than your available balance."
+            });
+
+        }
+
+        // Deduct immediately (escrow) so the same balance
+        // can't be requested twice while this is pending.
+
+        await pool.query(
+            `UPDATE sellers SET wallet_balance = wallet_balance - $1 WHERE id = $2`,
+            [Number(amount), seller.id]
+        );
+
+        await pool.query(
+            `
+            UPDATE sellers
+            SET bank_name = $1, bank_account_number = $2, bank_account_name = $3
+            WHERE id = $4
+            `,
+            [bankName, bankAccountNumber, bankAccountName, seller.id]
+        );
+
+        const result = await pool.query(
+            `
+            INSERT INTO payout_requests (
+                seller_id, amount, bank_name, bank_account_number, bank_account_name, status
+            )
+            VALUES ($1, $2, $3, $4, $5, 'pending')
+            RETURNING *
+            `,
+            [seller.id, Number(amount), bankName, bankAccountNumber, bankAccountName]
+        );
+
+        await pool.query(
+            `
+            INSERT INTO wallet_transactions (seller_id, type, amount, description)
+            VALUES ($1, 'payout_requested', $2, 'Payout requested — pending review')
+            `,
+            [seller.id, -Number(amount)]
+        );
+
+        res.status(201).json({
+            success: true,
+            payout: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Request payout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not submit your payout request."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// SELLER'S OWN PAYOUT HISTORY
+// ========================================
+
+app.get("/api/sellers/payouts", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const seller =
+            await getApprovedSeller(studentId);
+
+        if (!seller) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only approved sellers have payout history."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT *
+            FROM payout_requests
+            WHERE seller_id = $1
+            ORDER BY requested_at DESC
+            `,
+            [seller.id]
+        );
+
+        res.status(200).json({
+            success: true,
+            payouts: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch seller payouts error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your payout history."
         });
 
     }
