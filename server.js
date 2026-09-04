@@ -2162,6 +2162,55 @@ async function ensureErrandsSchemaExists() {
         await pool.query(
             `
             ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS current_lat NUMERIC(10, 6)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS current_lng NUMERIC(10, 6)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS location_updated_at TIMESTAMP
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE errands
+            ADD COLUMN IF NOT EXISTS pickup_lat NUMERIC(10, 6)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE errands
+            ADD COLUMN IF NOT EXISTS pickup_lng NUMERIC(10, 6)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE errands
+            ADD COLUMN IF NOT EXISTS destination_lat NUMERIC(10, 6)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE errands
+            ADD COLUMN IF NOT EXISTS destination_lng NUMERIC(10, 6)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE students
             ADD COLUMN IF NOT EXISTS errand_completed_count INTEGER DEFAULT 0
             `
         );
@@ -4981,6 +5030,41 @@ app.post(
 // shared by the products list, checkout, and
 // anywhere else price needs to be correct)
 // ========================================
+
+// ========================================
+// DISTANCE BETWEEN TWO COORDINATES
+// (Haversine formula — returns kilometers)
+// ========================================
+
+function haversineDistanceKm(lat1, lng1, lat2, lng2) {
+
+    if (lat1 == null || lng1 == null || lat2 == null || lng2 == null) {
+        return null;
+    }
+
+    const toRad =
+        function (deg) { return deg * (Math.PI / 180); };
+
+    const earthRadiusKm = 6371;
+
+    const dLat =
+        toRad(lat2 - lat1);
+
+    const dLng =
+        toRad(lng2 - lng1);
+
+    const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+        Math.sin(dLng / 2) * Math.sin(dLng / 2);
+
+    const c =
+        2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+    return earthRadiusKm * c;
+
+}
+
 
 function getEffectivePrice(product) {
 
@@ -8642,7 +8726,7 @@ app.post("/api/errands/create", async (req, res) => {
 
     try {
 
-        const { studentId, title, pickupLocation, destination, description, itemCost, errandFee } = req.body;
+        const { studentId, title, pickupLocation, destination, description, itemCost, errandFee, pickupLat, pickupLng, destinationLat, destinationLng } = req.body;
 
         if (!studentId || !title || !pickupLocation || !destination || !errandFee) {
 
@@ -8693,15 +8777,16 @@ app.post("/api/errands/create", async (req, res) => {
             INSERT INTO errands (
                 errand_code, student_id, title, pickup_location, destination, description,
                 item_cost, errand_fee, total_amount, kurios_commission, agent_earnings,
-                status, payment_reference
+                status, payment_reference, pickup_lat, pickup_lng, destination_lat, destination_lng
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, $13, $14, $15, $16)
             RETURNING *
             `,
             [
                 errandCode, studentId, title.trim(), pickupLocation.trim(), destination.trim(),
                 description ? description.trim() : null, itemCostEstimate, errandFeeAmount,
-                totalAmount, commission, agentEarnings, paymentReference
+                totalAmount, commission, agentEarnings, paymentReference,
+                pickupLat || null, pickupLng || null, destinationLat || null, destinationLng || null
             ]
         );
 
@@ -11396,7 +11481,7 @@ app.post("/api/students/errand-mode", async (req, res) => {
 
     try {
 
-        const { studentId, available, durationMinutes, serviceArea } = req.body;
+        const { studentId, available, durationMinutes, serviceArea, lat, lng } = req.body;
 
         if (!studentId) {
 
@@ -11447,17 +11532,25 @@ app.post("/api/students/errand-mode", async (req, res) => {
                 new Date(Date.now() + Number(durationMinutes) * 60000) :
                 null;
 
+        // Location is only ever stored while actively
+        // available — cleared the moment Errand Mode goes
+        // off, so it never lingers after someone stops
+        // being an active agent.
+
         const result = await pool.query(
             `
             UPDATE students
             SET
                 errand_mode_available = $1,
                 errand_available_until = $2,
-                errand_service_area = COALESCE($3, errand_service_area)
+                errand_service_area = COALESCE($3, errand_service_area),
+                current_lat = CASE WHEN $1 THEN COALESCE($5, current_lat) ELSE NULL END,
+                current_lng = CASE WHEN $1 THEN COALESCE($6, current_lng) ELSE NULL END,
+                location_updated_at = CASE WHEN $1 THEN CURRENT_TIMESTAMP ELSE NULL END
             WHERE id = $4
             RETURNING id, errand_mode_available, errand_available_until, errand_service_area
             `,
-            [!!available, availableUntil, serviceArea || null, studentId]
+            [!!available, availableUntil, serviceArea || null, studentId, lat || null, lng || null]
         );
 
         res.status(200).json({
@@ -11475,6 +11568,162 @@ app.post("/api/students/errand-mode", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Could not update your errand availability."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// STUDENTS — UPDATE CURRENT LOCATION
+// (only meaningful — and only accepted —
+// while actively an available agent, since
+// that's the only time location is stored
+// at all)
+// ========================================
+
+app.post("/api/students/location", async (req, res) => {
+
+    try {
+
+        const { studentId, lat, lng } = req.body;
+
+        if (!studentId || lat === undefined || lng === undefined) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId, lat, or lng."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            UPDATE students
+            SET current_lat = $1, current_lng = $2, location_updated_at = CURRENT_TIMESTAMP
+            WHERE id = $3 AND errand_mode_available = true
+            RETURNING id
+            `,
+            [lat, lng, studentId]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Turn on Errand Mode to share your location."
+            });
+
+        }
+
+        res.status(200).json({
+            success: true
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Update location error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not update your location."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ERRANDS — AGENT LIVE LOCATION
+// (student fetches their assigned agent's
+// current position — only once the agent
+// has actually started, and only the
+// errand's own student can see it)
+// ========================================
+
+app.get("/api/errands/:id/agent-location", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const errandResult = await pool.query(
+            `
+            SELECT
+                errands.student_id, errands.status, errands.destination_lat, errands.destination_lng,
+                students.current_lat, students.current_lng, students.location_updated_at
+            FROM errands
+            JOIN students ON students.id = errands.agent_id
+            WHERE errands.id = $1
+            LIMIT 1
+            `,
+            [id]
+        );
+
+        if (errandResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Errand not found or no agent assigned yet."
+            });
+
+        }
+
+        const errand =
+            errandResult.rows[0];
+
+        if (String(errand.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your errand."
+            });
+
+        }
+
+        if (!["in_progress", "picked_up", "on_way", "arrived"].includes(errand.status)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Live tracking isn't available until your agent starts the errand."
+            });
+
+        }
+
+        res.status(200).json({
+            success: true,
+            lat: errand.current_lat,
+            lng: errand.current_lng,
+            updatedAt: errand.location_updated_at,
+            destinationLat: errand.destination_lat,
+            destinationLng: errand.destination_lng
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch agent location error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your agent's location."
         });
 
     }
@@ -11504,7 +11753,7 @@ app.get("/api/errands/pool", async (req, res) => {
         }
 
         const studentCheck = await pool.query(
-            `SELECT errand_mode_available, errand_available_until FROM students WHERE id = $1 LIMIT 1`,
+            `SELECT errand_mode_available, errand_available_until, current_lat, current_lng FROM students WHERE id = $1 LIMIT 1`,
             [studentId]
         );
 
@@ -11545,19 +11794,58 @@ app.get("/api/errands/pool", async (req, res) => {
             `
             SELECT
                 id, errand_code, title, pickup_location, destination,
-                errand_fee, item_cost, total_amount, created_at
+                errand_fee, item_cost, total_amount, created_at, pickup_lat, pickup_lng
             FROM errands
             WHERE status = 'available'
             AND student_id != $1
-            ${orderClause}
+            ${sort === "near" ? "ORDER BY created_at ASC" : orderClause}
             LIMIT 30
             `,
             [studentId]
         );
 
+        let errands =
+            result.rows;
+
+        if (sort === "near") {
+
+            if (student.current_lat == null || student.current_lng == null) {
+
+                return res.status(200).json({
+                    success: true,
+                    errands: errands,
+                    message: "Share your location to sort by distance — showing newest first for now."
+                });
+
+            }
+
+            errands = errands.map(function (errand) {
+
+                return Object.assign({}, errand, {
+                    distance_km: haversineDistanceKm(
+                        Number(student.current_lat),
+                        Number(student.current_lng),
+                        errand.pickup_lat !== null ? Number(errand.pickup_lat) : null,
+                        errand.pickup_lng !== null ? Number(errand.pickup_lng) : null
+                    )
+                });
+
+            });
+
+            errands.sort(function (a, b) {
+
+                if (a.distance_km === null) return 1;
+                if (b.distance_km === null) return -1;
+
+                return a.distance_km - b.distance_km;
+
+            });
+
+        }
+
         res.status(200).json({
             success: true,
-            errands: result.rows
+            errands: errands
         });
 
     } catch (error) {
