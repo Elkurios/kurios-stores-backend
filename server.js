@@ -2285,6 +2285,7 @@ async function ensureErrandsSchemaExists() {
                 kurios_commission NUMERIC(12, 2),
                 provider_earnings NUMERIC(12, 2),
                 status TEXT NOT NULL DEFAULT 'open',
+                payment_status TEXT NOT NULL DEFAULT 'unpaid',
                 assigned_provider_id INTEGER REFERENCES students(id),
                 payment_reference TEXT UNIQUE,
                 payment_gateway TEXT,
@@ -5838,6 +5839,12 @@ async function routeWebhookVerification(paymentReference) {
     if (paymentReference.startsWith("kurios_errandagent_")) {
 
         return await verifyAndUpdateErrandAgentPayment(paymentReference);
+
+    }
+
+    if (paymentReference.startsWith("kurios_craftreq_")) {
+
+        return await verifyAndUpdateCraftRequestPayment(paymentReference);
 
     }
 
@@ -10062,14 +10069,23 @@ app.post("/api/craft-requests/:id/offer", async (req, res) => {
             const deliveryOtp =
                 String(crypto.randomInt(1000, 9999));
 
+            const commission =
+                Math.round(Number(craftRequest.proposed_price) * 0.20 * 100) / 100;
+
+            const providerEarnings =
+                Number(craftRequest.proposed_price) - commission;
+
+            const paymentReference =
+                "kurios_craftreq_" + Date.now() + "_" + crypto.randomInt(100000, 999999);
+
             const assignResult = await pool.query(
                 `
                 UPDATE craft_requests
-                SET status = 'assigned', assigned_provider_id = $1, agreed_price = $2, assigned_at = CURRENT_TIMESTAMP, delivery_otp = $3
-                WHERE id = $4 AND status = 'open'
+                SET status = 'assigned', assigned_provider_id = $1, agreed_price = $2, kurios_commission = $3, provider_earnings = $4, assigned_at = CURRENT_TIMESTAMP, delivery_otp = $5, payment_reference = $6
+                WHERE id = $7 AND status = 'open'
                 RETURNING *
                 `,
-                [studentId, craftRequest.proposed_price, deliveryOtp, id]
+                [studentId, craftRequest.proposed_price, commission, providerEarnings, deliveryOtp, paymentReference, id]
             );
 
             if (assignResult.rows.length === 0) {
@@ -10277,14 +10293,23 @@ app.post("/api/craft-requests/:id/offers/:offerId/approve", async (req, res) => 
         const deliveryOtp =
             String(crypto.randomInt(1000, 9999));
 
+        const commission =
+            Math.round(Number(offer.offered_price) * 0.20 * 100) / 100;
+
+        const providerEarnings =
+            Number(offer.offered_price) - commission;
+
+        const paymentReference =
+            "kurios_craftreq_" + Date.now() + "_" + crypto.randomInt(100000, 999999);
+
         const assignResult = await pool.query(
             `
             UPDATE craft_requests
-            SET status = 'assigned', assigned_provider_id = $1, agreed_price = $2, assigned_at = CURRENT_TIMESTAMP, delivery_otp = $3
-            WHERE id = $4 AND status = 'open'
+            SET status = 'assigned', assigned_provider_id = $1, agreed_price = $2, kurios_commission = $3, provider_earnings = $4, assigned_at = CURRENT_TIMESTAMP, delivery_otp = $5, payment_reference = $6
+            WHERE id = $7 AND status = 'open'
             RETURNING *
             `,
-            [offer.provider_id, offer.offered_price, deliveryOtp, id]
+            [offer.provider_id, offer.offered_price, commission, providerEarnings, deliveryOtp, paymentReference, id]
         );
 
         if (assignResult.rows.length === 0) {
@@ -10442,6 +10467,497 @@ app.get("/api/craft-requests/my-jobs", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Could not load your Craft jobs."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRAFT REQUESTS — PAY (student)
+// ========================================
+
+app.post("/api/craft-requests/:id/pay/:gateway", async (req, res) => {
+
+    try {
+
+        const { id, gateway } = req.params;
+        const { studentId, returnUrl, customerName, customerEmail } = req.body;
+
+        const requestResult = await pool.query(
+            `SELECT * FROM craft_requests WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (requestResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Request not found."
+            });
+
+        }
+
+        const craftRequest =
+            requestResult.rows[0];
+
+        if (String(craftRequest.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your request."
+            });
+
+        }
+
+        if (craftRequest.payment_status === "paid") {
+
+            return res.status(400).json({
+                success: false,
+                message: "This request is already paid for."
+            });
+
+        }
+
+        if (craftRequest.status !== "assigned") {
+
+            return res.status(400).json({
+                success: false,
+                message: "This request isn't ready for payment yet."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE craft_requests SET payment_gateway = $1 WHERE id = $2`,
+            [gateway, id]
+        );
+
+        const amount =
+            Number(craftRequest.agreed_price);
+
+        if (gateway === "monnify") {
+
+            return res.status(200).json({
+                success: true,
+                paymentReference: craftRequest.payment_reference,
+                amount: amount,
+                apiKey: MONNIFY_API_KEY,
+                contractCode: MONNIFY_CONTRACT_CODE
+            });
+
+        }
+
+        if (gateway === "opay") {
+
+            const opayData =
+                await createOpayCashierPayment({
+                    reference: craftRequest.payment_reference,
+                    amountNaira: amount,
+                    customerName: customerName || "Kurios Student",
+                    customerEmail: customerEmail || "",
+                    description: "Kurios Stores Craft Errand — " + craftRequest.skill,
+                    returnUrl: returnUrl,
+                    callbackUrl: OPAY_CALLBACK_URL
+                });
+
+            return res.status(200).json({
+                success: true,
+                cashierUrl: opayData.cashierUrl
+            });
+
+        }
+
+        if (gateway === "paystack") {
+
+            const paystackData =
+                await initializePaystackTransaction({
+                    reference: craftRequest.payment_reference,
+                    amountNaira: amount,
+                    email: customerEmail,
+                    callbackUrl: returnUrl
+                });
+
+            return res.status(200).json({
+                success: true,
+                authorizationUrl: paystackData.authorization_url
+            });
+
+        }
+
+        res.status(400).json({
+            success: false,
+            message: "Unknown payment gateway."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Craft request checkout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: error.message || "Could not start checkout."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRAFT REQUESTS — VERIFY PAYMENT
+// ========================================
+
+async function verifyAndUpdateCraftRequestPayment(paymentReference) {
+
+    const requestResult = await pool.query(
+        `SELECT * FROM craft_requests WHERE payment_reference = $1 LIMIT 1`,
+        [paymentReference]
+    );
+
+    if (requestResult.rows.length === 0) {
+
+        return {
+            success: false,
+            message: "Request not found.",
+            request: null
+        };
+
+    }
+
+    const craftRequest =
+        requestResult.rows[0];
+
+    if (craftRequest.payment_status === "paid") {
+
+        return {
+            success: true,
+            message: "Already paid.",
+            request: craftRequest
+        };
+
+    }
+
+    let isPaid = false;
+    let transactionReference = null;
+
+    try {
+
+        if (craftRequest.payment_gateway === "opay") {
+
+            const opayData =
+                await queryOpayPaymentStatus(paymentReference);
+
+            isPaid =
+                opayData.status === "SUCCESS" &&
+                Number(opayData.amount.total) >= Math.round(Number(craftRequest.agreed_price) * 100);
+
+            transactionReference = opayData.orderNo;
+
+        } else if (craftRequest.payment_gateway === "paystack") {
+
+            const paystackData =
+                await verifyPaystackTransaction(paymentReference);
+
+            isPaid =
+                paystackData.status === "success" &&
+                Number(paystackData.amount) >= Math.round(Number(craftRequest.agreed_price) * 100);
+
+            transactionReference = paystackData.id;
+
+        } else {
+
+            const accessToken =
+                await getMonnifyAccessToken();
+
+            const verifyResponse = await fetch(
+                MONNIFY_BASE_URL +
+                "/api/v2/merchant/transactions/query?paymentReference=" +
+                encodeURIComponent(paymentReference),
+                {
+                    headers: { "Authorization": "Bearer " + accessToken },
+                    signal: AbortSignal.timeout(15000)
+                }
+            );
+
+            const verifyData = await verifyResponse.json();
+
+            if (verifyData.requestSuccessful) {
+
+                const paymentStatus =
+                    verifyData.responseBody.paymentStatus;
+
+                isPaid =
+                    (paymentStatus === "PAID" || paymentStatus === "OVERPAID") &&
+                    Number(verifyData.responseBody.amountPaid || 0) >= Number(craftRequest.agreed_price);
+
+                transactionReference = verifyData.responseBody.transactionReference;
+
+            }
+
+        }
+
+    } catch (error) {
+
+        return {
+            success: false,
+            message: "Could not verify this payment.",
+            request: craftRequest
+        };
+
+    }
+
+    if (!isPaid) {
+
+        return {
+            success: false,
+            message: "Payment not yet confirmed.",
+            request: craftRequest
+        };
+
+    }
+
+    const updated = await pool.query(
+        `
+        UPDATE craft_requests
+        SET payment_status = 'paid', transaction_reference = $1
+        WHERE id = $2
+        RETURNING *
+        `,
+        [transactionReference, craftRequest.id]
+    );
+
+    return {
+        success: true,
+        message: "Payment confirmed.",
+        request: updated.rows[0]
+    };
+
+}
+
+app.post("/api/craft-requests/verify", async (req, res) => {
+
+    try {
+
+        const { paymentReference } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const result =
+            await verifyAndUpdateCraftRequestPayment(paymentReference);
+
+        if (!result.request) {
+            return res.status(404).json(result);
+        }
+
+        res.status(200).json(result);
+
+    } catch (error) {
+
+        console.error(
+            "Craft request verify error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Something went wrong while verifying this payment."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRAFT REQUESTS — START SERVICE (provider)
+// (requires payment to be confirmed first)
+// ========================================
+
+app.post("/api/craft-requests/:id/start", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId } = req.body;
+
+        const requestResult = await pool.query(
+            `SELECT * FROM craft_requests WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (requestResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Request not found."
+            });
+
+        }
+
+        const craftRequest =
+            requestResult.rows[0];
+
+        if (String(craftRequest.assigned_provider_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only the assigned provider can start this service."
+            });
+
+        }
+
+        if (craftRequest.payment_status !== "paid") {
+
+            return res.status(400).json({
+                success: false,
+                message: "Waiting on the student to complete payment first."
+            });
+
+        }
+
+        if (craftRequest.status !== "assigned") {
+
+            return res.status(400).json({
+                success: false,
+                message: "This request isn't at the right stage to start."
+            });
+
+        }
+
+        const updated = await pool.query(
+            `UPDATE craft_requests SET status = 'in_progress' WHERE id = $1 RETURNING *`,
+            [id]
+        );
+
+        res.status(200).json({
+            success: true,
+            request: updated.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Start craft service error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not start this service."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRAFT REQUESTS — CONFIRM COMPLETION (OTP)
+// ========================================
+
+app.post("/api/craft-requests/:id/confirm-completion", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId, otp } = req.body;
+
+        if (!studentId || !otp) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please enter the completion code."
+            });
+
+        }
+
+        const requestResult = await pool.query(
+            `SELECT * FROM craft_requests WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (requestResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Request not found."
+            });
+
+        }
+
+        const craftRequest =
+            requestResult.rows[0];
+
+        if (String(craftRequest.assigned_provider_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only the assigned provider can confirm completion."
+            });
+
+        }
+
+        if (craftRequest.status !== "in_progress") {
+
+            return res.status(400).json({
+                success: false,
+                message: "Start the service before confirming completion."
+            });
+
+        }
+
+        if (String(otp).trim() !== String(craftRequest.delivery_otp)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "That code doesn't match. Please check with the student."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE students SET wallet_balance = COALESCE(wallet_balance, 0) + $1 WHERE id = $2`,
+            [Number(craftRequest.provider_earnings), craftRequest.assigned_provider_id]
+        );
+
+        const updated = await pool.query(
+            `
+            UPDATE craft_requests
+            SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            RETURNING *
+            `,
+            [id]
+        );
+
+        res.status(200).json({
+            success: true,
+            request: updated.rows[0],
+            released: Number(craftRequest.provider_earnings)
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Confirm craft completion error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not confirm completion."
         });
 
     }
