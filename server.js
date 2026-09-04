@@ -2208,6 +2208,71 @@ async function ensureErrandsSchemaExists() {
 
         await pool.query(
             `
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS is_errand_agent_registered BOOLEAN DEFAULT false
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS errand_agent_registered_at TIMESTAMP
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS errand_agent_phone_verified BOOLEAN DEFAULT false
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS errand_agent_payment_reference TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS phone_verification_codes (
+                id SERIAL PRIMARY KEY,
+                student_id INTEGER REFERENCES students(id),
+                phone TEXT NOT NULL,
+                code TEXT NOT NULL,
+                purpose TEXT NOT NULL DEFAULT 'errand_agent',
+                expires_at TIMESTAMP NOT NULL,
+                verified_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS errand_agent_payment_gateway TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS craft_providers (
+                id SERIAL PRIMARY KEY,
+                student_id INTEGER REFERENCES students(id) UNIQUE,
+                skills JSONB NOT NULL DEFAULT '[]'::jsonb,
+                bio TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                payment_reference TEXT UNIQUE,
+                payment_gateway TEXT,
+                registered_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        await pool.query(
+            `
             CREATE TABLE IF NOT EXISTS errands (
                 id SERIAL PRIMARY KEY,
                 errand_code TEXT UNIQUE,
@@ -5718,6 +5783,18 @@ async function routeWebhookVerification(paymentReference) {
 
     }
 
+    if (paymentReference.startsWith("kurios_errandagent_")) {
+
+        return await verifyAndUpdateErrandAgentPayment(paymentReference);
+
+    }
+
+    if (paymentReference.startsWith("kurios_craft_")) {
+
+        return await verifyAndUpdateCraftProviderPayment(paymentReference);
+
+    }
+
     if (paymentReference.startsWith("kurios_errand_item_")) {
 
         return await verifyAndUpdateErrandItemCostPayment(paymentReference);
@@ -8802,6 +8879,851 @@ app.post("/api/errands/verify", async (req, res) => {
 // ERRAND MODE — AVAILABILITY TOGGLE
 // ========================================
 
+// ========================================
+// SEND AN SMS
+// ⚠️ NOT YET CONFIGURED — this app has no
+// SMS gateway integrated (only email, via
+// Resend). This function currently just
+// logs the code to the server console so
+// verification is testable in development.
+// To actually send real SMS, wire in a
+// provider here (e.g. Termii, Africa's
+// Talking, or Twilio) using their API —
+// same situation as Monnify needing real
+// credentials before it can process
+// payments.
+// ========================================
+
+async function sendPhoneVerificationSms(phone, code) {
+
+    console.log(
+        "[SMS NOT CONFIGURED] Would send to " + phone + ": Your Kurios Stores verification code is " + code
+    );
+
+    return { sent: false, simulated: true };
+
+}
+
+app.post("/api/students/phone-verify/send", async (req, res) => {
+
+    try {
+
+        const { studentId, phone } = req.body;
+
+        if (!studentId || !phone) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId or phone."
+            });
+
+        }
+
+        const code =
+            String(crypto.randomInt(100000, 999999));
+
+        const expiresAt =
+            new Date(Date.now() + 10 * 60000);
+
+        await pool.query(
+            `
+            INSERT INTO phone_verification_codes (student_id, phone, code, purpose, expires_at)
+            VALUES ($1, $2, $3, 'errand_agent', $4)
+            `,
+            [studentId, phone, code, expiresAt]
+        );
+
+        await sendPhoneVerificationSms(phone, code);
+
+        res.status(200).json({
+            success: true,
+            message: "A verification code has been sent to your phone."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Send phone verification error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not send a verification code."
+        });
+
+    }
+
+});
+
+app.post("/api/students/phone-verify/confirm", async (req, res) => {
+
+    try {
+
+        const { studentId, code } = req.body;
+
+        if (!studentId || !code) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId or code."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT * FROM phone_verification_codes
+            WHERE student_id = $1
+            AND purpose = 'errand_agent'
+            AND code = $2
+            AND verified_at IS NULL
+            AND expires_at > CURRENT_TIMESTAMP
+            ORDER BY created_at DESC
+            LIMIT 1
+            `,
+            [studentId, code]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(400).json({
+                success: false,
+                message: "That code is invalid or has expired."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE phone_verification_codes SET verified_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [result.rows[0].id]
+        );
+
+        await pool.query(
+            `UPDATE students SET errand_agent_phone_verified = true WHERE id = $1`,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Phone number verified."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Confirm phone verification error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not verify your phone number."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ERRAND AGENT REGISTRATION (₦500)
+// ========================================
+
+app.post("/api/errand-agent/register", async (req, res) => {
+
+    try {
+
+        const { studentId, phone, serviceArea } = req.body;
+
+        if (!studentId || !phone) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId or phone."
+            });
+
+        }
+
+        const studentResult = await pool.query(
+            `SELECT errand_agent_phone_verified, is_errand_agent_registered FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (studentResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Student not found."
+            });
+
+        }
+
+        const student =
+            studentResult.rows[0];
+
+        if (student.is_errand_agent_registered) {
+
+            return res.status(400).json({
+                success: false,
+                message: "You're already registered as an Errand Agent."
+            });
+
+        }
+
+        if (!student.errand_agent_phone_verified) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please verify your phone number before registering."
+            });
+
+        }
+
+        const paymentReference =
+            "kurios_errandagent_" + Date.now() + "_" + crypto.randomInt(100000, 999999);
+
+        await pool.query(
+            `
+            UPDATE students
+            SET phone = COALESCE($1, phone), errand_service_area = $2, errand_agent_payment_reference = $3
+            WHERE id = $4
+            `,
+            [phone, serviceArea || null, paymentReference, studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            paymentReference: paymentReference,
+            amount: 500
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Errand agent registration error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not start your registration."
+        });
+
+    }
+
+});
+
+app.post("/api/errand-agent/pay/:gateway", async (req, res) => {
+
+    try {
+
+        const { gateway } = req.params;
+        const { paymentReference, returnUrl, customerName, customerEmail } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const studentResult = await pool.query(
+            `SELECT id FROM students WHERE errand_agent_payment_reference = $1 LIMIT 1`,
+            [paymentReference]
+        );
+
+        if (studentResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Registration not found."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE students SET errand_agent_payment_gateway = $1 WHERE errand_agent_payment_reference = $2`,
+            [gateway, paymentReference]
+        );
+
+        if (gateway === "monnify") {
+
+            return res.status(200).json({
+                success: true,
+                paymentReference: paymentReference,
+                amount: 500,
+                apiKey: MONNIFY_API_KEY,
+                contractCode: MONNIFY_CONTRACT_CODE
+            });
+
+        }
+
+        if (gateway === "opay") {
+
+            const opayData =
+                await createOpayCashierPayment({
+                    reference: paymentReference,
+                    amountNaira: 500,
+                    customerName: customerName || "Kurios Student",
+                    customerEmail: customerEmail || "",
+                    description: "Kurios Stores Errand Agent registration",
+                    returnUrl: returnUrl,
+                    callbackUrl: OPAY_CALLBACK_URL
+                });
+
+            return res.status(200).json({
+                success: true,
+                cashierUrl: opayData.cashierUrl
+            });
+
+        }
+
+        if (gateway === "paystack") {
+
+            const paystackData =
+                await initializePaystackTransaction({
+                    reference: paymentReference,
+                    amountNaira: 500,
+                    email: customerEmail,
+                    callbackUrl: returnUrl
+                });
+
+            return res.status(200).json({
+                success: true,
+                authorizationUrl: paystackData.authorization_url
+            });
+
+        }
+
+        res.status(400).json({
+            success: false,
+            message: "Unknown payment gateway."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Errand agent checkout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: error.message || "Could not start checkout."
+        });
+
+    }
+
+});
+
+async function verifyAndUpdateErrandAgentPayment(paymentReference) {
+
+    const studentResult = await pool.query(
+        `SELECT * FROM students WHERE errand_agent_payment_reference = $1 LIMIT 1`,
+        [paymentReference]
+    );
+
+    if (studentResult.rows.length === 0) {
+
+        return {
+            success: false,
+            message: "Registration not found.",
+            student: null
+        };
+
+    }
+
+    const student =
+        studentResult.rows[0];
+
+    if (student.is_errand_agent_registered) {
+
+        return {
+            success: true,
+            message: "Already registered.",
+            student: student
+        };
+
+    }
+
+    let isPaid = false;
+
+    try {
+
+        if (student.errand_agent_payment_gateway === "opay") {
+
+            const opayData =
+                await queryOpayPaymentStatus(paymentReference);
+
+            isPaid =
+                opayData.status === "SUCCESS" &&
+                Number(opayData.amount.total) >= 50000;
+
+        } else if (student.errand_agent_payment_gateway === "paystack") {
+
+            const paystackData =
+                await verifyPaystackTransaction(paymentReference);
+
+            isPaid =
+                paystackData.status === "success" &&
+                Number(paystackData.amount) >= 50000;
+
+        } else {
+
+            const accessToken =
+                await getMonnifyAccessToken();
+
+            const verifyResponse = await fetch(
+                MONNIFY_BASE_URL +
+                "/api/v2/merchant/transactions/query?paymentReference=" +
+                encodeURIComponent(paymentReference),
+                {
+                    headers: { "Authorization": "Bearer " + accessToken },
+                    signal: AbortSignal.timeout(15000)
+                }
+            );
+
+            const verifyData = await verifyResponse.json();
+
+            if (verifyData.requestSuccessful) {
+
+                const paymentStatus =
+                    verifyData.responseBody.paymentStatus;
+
+                isPaid =
+                    (paymentStatus === "PAID" || paymentStatus === "OVERPAID") &&
+                    Number(verifyData.responseBody.amountPaid || 0) >= 500;
+
+            }
+
+        }
+
+    } catch (error) {
+
+        return {
+            success: false,
+            message: "Could not verify this payment.",
+            student: student
+        };
+
+    }
+
+    if (!isPaid) {
+
+        return {
+            success: false,
+            message: "Payment not yet confirmed.",
+            student: student
+        };
+
+    }
+
+    const updated = await pool.query(
+        `
+        UPDATE students
+        SET is_errand_agent_registered = true, errand_agent_registered_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+        RETURNING *
+        `,
+        [student.id]
+    );
+
+    return {
+        success: true,
+        message: "You're now a registered Errand Agent.",
+        student: updated.rows[0]
+    };
+
+}
+
+app.post("/api/errand-agent/verify", async (req, res) => {
+
+    try {
+
+        const { paymentReference } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const result =
+            await verifyAndUpdateErrandAgentPayment(paymentReference);
+
+        if (!result.student) {
+            return res.status(404).json(result);
+        }
+
+        res.status(200).json(result);
+
+    } catch (error) {
+
+        console.error(
+            "Errand agent verify error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Something went wrong while verifying your registration."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRAFT PROVIDER REGISTRATION (₦2,000)
+// (one registration can cover multiple
+// skills)
+// ========================================
+
+app.post("/api/craft-providers/register", async (req, res) => {
+
+    try {
+
+        const { studentId, skills, bio } = req.body;
+
+        if (!studentId || !Array.isArray(skills) || skills.length === 0) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please select at least one skill."
+            });
+
+        }
+
+        const existing = await pool.query(
+            `SELECT id, status FROM craft_providers WHERE student_id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (existing.rows.length > 0 && existing.rows[0].status === "active") {
+
+            return res.status(400).json({
+                success: false,
+                message: "You're already registered as a Craft provider."
+            });
+
+        }
+
+        const paymentReference =
+            "kurios_craft_" + Date.now() + "_" + crypto.randomInt(100000, 999999);
+
+        if (existing.rows.length > 0) {
+
+            await pool.query(
+                `
+                UPDATE craft_providers
+                SET skills = $1, bio = $2, payment_reference = $3, status = 'pending'
+                WHERE student_id = $4
+                `,
+                [JSON.stringify(skills), bio || null, paymentReference, studentId]
+            );
+
+        } else {
+
+            await pool.query(
+                `
+                INSERT INTO craft_providers (student_id, skills, bio, payment_reference, status)
+                VALUES ($1, $2, $3, $4, 'pending')
+                `,
+                [studentId, JSON.stringify(skills), bio || null, paymentReference]
+            );
+
+        }
+
+        res.status(200).json({
+            success: true,
+            paymentReference: paymentReference,
+            amount: 2000
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Craft provider registration error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not start your registration."
+        });
+
+    }
+
+});
+
+app.post("/api/craft-providers/pay/:gateway", async (req, res) => {
+
+    try {
+
+        const { gateway } = req.params;
+        const { paymentReference, returnUrl, customerName, customerEmail } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const providerResult = await pool.query(
+            `SELECT id FROM craft_providers WHERE payment_reference = $1 LIMIT 1`,
+            [paymentReference]
+        );
+
+        if (providerResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Registration not found."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE craft_providers SET payment_gateway = $1 WHERE payment_reference = $2`,
+            [gateway, paymentReference]
+        );
+
+        if (gateway === "monnify") {
+
+            return res.status(200).json({
+                success: true,
+                paymentReference: paymentReference,
+                amount: 2000,
+                apiKey: MONNIFY_API_KEY,
+                contractCode: MONNIFY_CONTRACT_CODE
+            });
+
+        }
+
+        if (gateway === "opay") {
+
+            const opayData =
+                await createOpayCashierPayment({
+                    reference: paymentReference,
+                    amountNaira: 2000,
+                    customerName: customerName || "Kurios Student",
+                    customerEmail: customerEmail || "",
+                    description: "Kurios Stores Craft Errand registration",
+                    returnUrl: returnUrl,
+                    callbackUrl: OPAY_CALLBACK_URL
+                });
+
+            return res.status(200).json({
+                success: true,
+                cashierUrl: opayData.cashierUrl
+            });
+
+        }
+
+        if (gateway === "paystack") {
+
+            const paystackData =
+                await initializePaystackTransaction({
+                    reference: paymentReference,
+                    amountNaira: 2000,
+                    email: customerEmail,
+                    callbackUrl: returnUrl
+                });
+
+            return res.status(200).json({
+                success: true,
+                authorizationUrl: paystackData.authorization_url
+            });
+
+        }
+
+        res.status(400).json({
+            success: false,
+            message: "Unknown payment gateway."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Craft provider checkout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: error.message || "Could not start checkout."
+        });
+
+    }
+
+});
+
+async function verifyAndUpdateCraftProviderPayment(paymentReference) {
+
+    const providerResult = await pool.query(
+        `SELECT * FROM craft_providers WHERE payment_reference = $1 LIMIT 1`,
+        [paymentReference]
+    );
+
+    if (providerResult.rows.length === 0) {
+
+        return {
+            success: false,
+            message: "Registration not found.",
+            provider: null
+        };
+
+    }
+
+    const provider =
+        providerResult.rows[0];
+
+    if (provider.status === "active") {
+
+        return {
+            success: true,
+            message: "Already registered.",
+            provider: provider
+        };
+
+    }
+
+    let isPaid = false;
+
+    try {
+
+        if (provider.payment_gateway === "opay") {
+
+            const opayData =
+                await queryOpayPaymentStatus(paymentReference);
+
+            isPaid =
+                opayData.status === "SUCCESS" &&
+                Number(opayData.amount.total) >= 200000;
+
+        } else if (provider.payment_gateway === "paystack") {
+
+            const paystackData =
+                await verifyPaystackTransaction(paymentReference);
+
+            isPaid =
+                paystackData.status === "success" &&
+                Number(paystackData.amount) >= 200000;
+
+        } else {
+
+            const accessToken =
+                await getMonnifyAccessToken();
+
+            const verifyResponse = await fetch(
+                MONNIFY_BASE_URL +
+                "/api/v2/merchant/transactions/query?paymentReference=" +
+                encodeURIComponent(paymentReference),
+                {
+                    headers: { "Authorization": "Bearer " + accessToken },
+                    signal: AbortSignal.timeout(15000)
+                }
+            );
+
+            const verifyData = await verifyResponse.json();
+
+            if (verifyData.requestSuccessful) {
+
+                const paymentStatus =
+                    verifyData.responseBody.paymentStatus;
+
+                isPaid =
+                    (paymentStatus === "PAID" || paymentStatus === "OVERPAID") &&
+                    Number(verifyData.responseBody.amountPaid || 0) >= 2000;
+
+            }
+
+        }
+
+    } catch (error) {
+
+        return {
+            success: false,
+            message: "Could not verify this payment.",
+            provider: provider
+        };
+
+    }
+
+    if (!isPaid) {
+
+        return {
+            success: false,
+            message: "Payment not yet confirmed.",
+            provider: provider
+        };
+
+    }
+
+    const updated = await pool.query(
+        `UPDATE craft_providers SET status = 'active' WHERE id = $1 RETURNING *`,
+        [provider.id]
+    );
+
+    return {
+        success: true,
+        message: "You're now a registered Craft provider.",
+        provider: updated.rows[0]
+    };
+
+}
+
+app.post("/api/craft-providers/verify", async (req, res) => {
+
+    try {
+
+        const { paymentReference } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const result =
+            await verifyAndUpdateCraftProviderPayment(paymentReference);
+
+        if (!result.provider) {
+            return res.status(404).json(result);
+        }
+
+        res.status(200).json(result);
+
+    } catch (error) {
+
+        console.error(
+            "Craft provider verify error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Something went wrong while verifying your registration."
+        });
+
+    }
+
+});
+
+
 app.get("/api/students/errand-mode", async (req, res) => {
 
     try {
@@ -8877,7 +9799,7 @@ app.post("/api/students/errand-mode", async (req, res) => {
         }
 
         const studentCheck = await pool.query(
-            `SELECT email_verified, is_suspended FROM students WHERE id = $1 LIMIT 1`,
+            `SELECT email_verified, is_suspended, is_errand_agent_registered FROM students WHERE id = $1 LIMIT 1`,
             [studentId]
         );
 
@@ -8898,6 +9820,15 @@ app.post("/api/students/errand-mode", async (req, res) => {
             return res.status(403).json({
                 success: false,
                 message: "Your account isn't eligible for Errand Mode right now."
+            });
+
+        }
+
+        if (available && !student.is_errand_agent_registered) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Please register as an Errand Agent before turning on Errand Mode."
             });
 
         }
@@ -9056,7 +9987,7 @@ app.post("/api/errands/:id/accept", async (req, res) => {
         }
 
         const agentCheck = await pool.query(
-            `SELECT errand_mode_available, errand_available_until FROM students WHERE id = $1 LIMIT 1`,
+            `SELECT errand_mode_available, errand_available_until, is_errand_agent_registered FROM students WHERE id = $1 LIMIT 1`,
             [studentId]
         );
 
@@ -9071,6 +10002,15 @@ app.post("/api/errands/:id/accept", async (req, res) => {
 
         const agent =
             agentCheck.rows[0];
+
+        if (!agent.is_errand_agent_registered) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Please register as an Errand Agent before accepting errands."
+            });
+
+        }
 
         const stillAvailable =
             agent.errand_mode_available &&
