@@ -9196,6 +9196,59 @@ app.get("/api/errands/my", async (req, res) => {
 
 
 // ========================================
+// ERRANDS — MY ACTIVE TASKS
+// (as the acting agent, not the requester)
+// ========================================
+
+app.get("/api/errands/my-tasks", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT *
+            FROM errands
+            WHERE agent_id = $1
+            AND status NOT IN ('completed', 'cancelled', 'failed')
+            ORDER BY accepted_at DESC
+            `,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            errands: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch my errand tasks error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your active errand tasks."
+        });
+
+    }
+
+});
+
+
+// ========================================
 // ERRANDS — AGENT REPORTS THE ACTUAL
 // ITEM COST (once known, at the store)
 // ========================================
