@@ -1305,6 +1305,27 @@ async function ensureProductSellerColumnsExist() {
             `
         );
 
+        await pool.query(
+            `
+            ALTER TABLE products
+            ADD COLUMN IF NOT EXISTS discount_price NUMERIC(12, 2)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE products
+            ADD COLUMN IF NOT EXISTS discount_starts_at TIMESTAMP
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE products
+            ADD COLUMN IF NOT EXISTS discount_ends_at TIMESTAMP
+            `
+        );
+
         console.log(
             "Product seller columns are ready."
         );
@@ -2170,7 +2191,19 @@ app.get("/api/products", async (req, res) => {
             `
         );
 
-        res.json(result.rows);
+        res.json(
+            result.rows.map(function (product) {
+
+                const effectivePrice =
+                    getEffectivePrice(product);
+
+                return Object.assign({}, product, {
+                    effective_price: effectivePrice,
+                    is_on_sale: effectivePrice < Number(product.price)
+                });
+
+            })
+        );
 
     } catch (error) {
 
@@ -4641,6 +4674,46 @@ app.post(
     from the browser.
 */
 
+// ========================================
+// EFFECTIVE PRICE OF A PRODUCT
+// (accounts for an active discount window —
+// shared by the products list, checkout, and
+// anywhere else price needs to be correct)
+// ========================================
+
+function getEffectivePrice(product) {
+
+    const originalPrice =
+        Number(product.price);
+
+    const hasDiscountValue =
+        product.discount_price !== null &&
+        product.discount_price !== undefined &&
+        Number(product.discount_price) < originalPrice;
+
+    if (!hasDiscountValue) {
+        return originalPrice;
+    }
+
+    const now = new Date();
+
+    const startsOk =
+        !product.discount_starts_at ||
+        new Date(product.discount_starts_at) <= now;
+
+    const endsOk =
+        !product.discount_ends_at ||
+        new Date(product.discount_ends_at) >= now;
+
+    if (startsOk && endsOk) {
+        return Number(product.discount_price);
+    }
+
+    return originalPrice;
+
+}
+
+
 async function buildTrustedOrderItems(items) {
 
     const productIds =
@@ -4650,7 +4723,7 @@ async function buildTrustedOrderItems(items) {
 
     const productsResult = await pool.query(
         `
-        SELECT id, name, price
+        SELECT id, name, price, discount_price, discount_starts_at, discount_ends_at
         FROM products
         WHERE id = ANY($1::int[])
         `,
@@ -4684,15 +4757,18 @@ async function buildTrustedOrderItems(items) {
                 parseInt(item.quantity) || 1
             );
 
+        const unitPrice =
+            getEffectivePrice(product);
+
         const lineTotal =
-            Number(product.price) * quantity;
+            unitPrice * quantity;
 
         totalAmount += lineTotal;
 
         trustedItems.push({
             id: product.id,
             name: product.name,
-            price: Number(product.price),
+            price: unitPrice,
             quantity: quantity
         });
 
@@ -9698,7 +9774,10 @@ app.post(
                 description,
                 price,
                 category,
-                stockQuantity
+                stockQuantity,
+                discountPrice,
+                discountStartsAt,
+                discountEndsAt
             } = req.body;
 
             if (!studentId || !name || !price) {
@@ -9736,9 +9815,12 @@ app.post(
                     image_url,
                     category,
                     stock_quantity,
-                    seller_id
+                    seller_id,
+                    discount_price,
+                    discount_starts_at,
+                    discount_ends_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 RETURNING *
                 `,
                 [
@@ -9748,7 +9830,10 @@ app.post(
                     imageUrl,
                     category ? category.trim() : null,
                     stockQuantity ? parseInt(stockQuantity, 10) : 0,
-                    seller.id
+                    seller.id,
+                    discountPrice ? Number(discountPrice) : null,
+                    discountStartsAt || null,
+                    discountEndsAt || null
                 ]
             );
 
@@ -9880,7 +9965,10 @@ app.post(
                 price,
                 category,
                 stockQuantity,
-                isActive
+                isActive,
+                discountPrice,
+                discountStartsAt,
+                discountEndsAt
             } = req.body;
 
             if (!studentId) {
@@ -9946,8 +10034,11 @@ app.post(
                     stock_quantity = $5,
                     image_url = $6,
                     is_active = $7,
+                    discount_price = $8,
+                    discount_starts_at = $9,
+                    discount_ends_at = $10,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE id = $8
+                WHERE id = $11
                 RETURNING *
                 `,
                 [
@@ -9966,6 +10057,15 @@ app.post(
                     isActive !== undefined ?
                         (isActive === "true" || isActive === true) :
                         currentProduct.is_active,
+                    discountPrice !== undefined ?
+                        (discountPrice === "" || discountPrice === null ? null : Number(discountPrice)) :
+                        currentProduct.discount_price,
+                    discountStartsAt !== undefined ?
+                        (discountStartsAt || null) :
+                        currentProduct.discount_starts_at,
+                    discountEndsAt !== undefined ?
+                        (discountEndsAt || null) :
+                        currentProduct.discount_ends_at,
                     id
                 ]
             );
