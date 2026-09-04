@@ -16648,6 +16648,173 @@ app.post("/api/chat/contact-seller", async (req, res) => {
 
 
 // ========================================
+// ORDER — LIST DISTINCT SELLERS
+// (an order can span multiple sellers,
+// since checkout doesn't restrict the cart
+// to one store)
+// ========================================
+
+app.get("/api/orders/:id/sellers", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const orderResult = await pool.query(
+            `SELECT * FROM orders WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (orderResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Order not found."
+            });
+
+        }
+
+        const order =
+            orderResult.rows[0];
+
+        if (String(order.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your order."
+            });
+
+        }
+
+        const productIds =
+            (order.items || []).map(function (item) { return item.id; });
+
+        if (productIds.length === 0) {
+
+            return res.status(200).json({
+                success: true,
+                sellers: []
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT DISTINCT
+                sellers.id AS seller_id,
+                sellers.store_name,
+                sellers.student_id AS seller_student_id
+            FROM products
+            JOIN sellers ON sellers.id = products.seller_id
+            WHERE products.id = ANY($1::int[])
+            AND sellers.student_id IS NOT NULL
+            AND sellers.student_id != $2
+            `,
+            [productIds, studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            sellers: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch order sellers error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load sellers for this order."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CHAT — CONTACT A SELLER ABOUT AN ORDER
+// (order-context conversation, distinct
+// from a general product inquiry)
+// ========================================
+
+app.post("/api/chat/contact-seller-about-order", async (req, res) => {
+
+    try {
+
+        const { studentId, orderId, sellerStudentId } = req.body;
+
+        if (!studentId || !orderId || !sellerStudentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId, orderId, or sellerStudentId."
+            });
+
+        }
+
+        const orderResult = await pool.query(
+            `SELECT student_id FROM orders WHERE id = $1 LIMIT 1`,
+            [orderId]
+        );
+
+        if (orderResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Order not found."
+            });
+
+        }
+
+        if (String(orderResult.rows[0].student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your order."
+            });
+
+        }
+
+        const conversationId =
+            await findOrCreateConversation(studentId, sellerStudentId, "ORDER", orderId);
+
+        res.status(200).json({
+            success: true,
+            conversationId: conversationId
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Contact seller about order error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not start a conversation about this order."
+        });
+
+    }
+
+});
+
+
+// ========================================
 // START SERVER
 // ========================================
 
