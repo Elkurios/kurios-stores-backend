@@ -10965,6 +10965,220 @@ app.post("/api/craft-requests/:id/confirm-completion", async (req, res) => {
 });
 
 
+// ========================================
+// CRAFT REQUESTS — CANCEL (student-initiated)
+// ========================================
+
+app.post("/api/craft-requests/:id/cancel", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId, reason } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const requestResult = await pool.query(
+            `SELECT * FROM craft_requests WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (requestResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Request not found."
+            });
+
+        }
+
+        const craftRequest =
+            requestResult.rows[0];
+
+        if (String(craftRequest.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your request."
+            });
+
+        }
+
+        if (["completed", "cancelled"].includes(craftRequest.status)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "This request can no longer be cancelled."
+            });
+
+        }
+
+        if (craftRequest.status === "in_progress") {
+
+            return res.status(400).json({
+                success: false,
+                message: "The service has already started — try messaging your provider instead."
+            });
+
+        }
+
+        let refundAmount = 0;
+
+        if (craftRequest.payment_status === "paid") {
+            refundAmount = Number(craftRequest.agreed_price);
+        }
+
+        if (refundAmount > 0) {
+
+            await pool.query(
+                `UPDATE students SET wallet_balance = COALESCE(wallet_balance, 0) + $1 WHERE id = $2`,
+                [refundAmount, studentId]
+            );
+
+        }
+
+        const updated = await pool.query(
+            `
+            UPDATE craft_requests
+            SET status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            RETURNING *
+            `,
+            [id]
+        );
+
+        res.status(200).json({
+            success: true,
+            request: updated.rows[0],
+            refunded: refundAmount
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Cancel craft request error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not cancel this request."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRAFT REQUESTS — RATE THE PROVIDER
+// ========================================
+
+app.post("/api/craft-requests/:id/rate", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId, rating, comment } = req.body;
+
+        if (!studentId || !rating || Number(rating) < 1 || Number(rating) > 5) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please give a rating between 1 and 5 stars."
+            });
+
+        }
+
+        const requestResult = await pool.query(
+            `SELECT * FROM craft_requests WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (requestResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Request not found."
+            });
+
+        }
+
+        const craftRequest =
+            requestResult.rows[0];
+
+        if (String(craftRequest.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your request."
+            });
+
+        }
+
+        if (craftRequest.status !== "completed") {
+
+            return res.status(400).json({
+                success: false,
+                message: "You can only rate a completed job."
+            });
+
+        }
+
+        if (craftRequest.rating) {
+
+            return res.status(400).json({
+                success: false,
+                message: "You've already rated this job."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE craft_requests SET rating = $1, rating_comment = $2 WHERE id = $3`,
+            [Number(rating), comment || null, id]
+        );
+
+        await pool.query(
+            `
+            UPDATE students
+            SET
+                errand_rating_total = COALESCE(errand_rating_total, 0) + $1,
+                errand_rating_count = COALESCE(errand_rating_count, 0) + 1
+            WHERE id = $2
+            `,
+            [Number(rating), craftRequest.assigned_provider_id]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Thanks for rating your provider!"
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Rate craft request error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not submit your rating."
+        });
+
+    }
+
+});
+
+
 app.get("/api/students/errand-mode", async (req, res) => {
 
     try {
@@ -12050,6 +12264,331 @@ app.post("/api/errands/:id/confirm-delivery", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Could not confirm delivery."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ERRANDS — CANCEL (student-initiated)
+// Refunds any amounts already paid back
+// to the student's wallet. Not allowed
+// once the agent has marked "on the way"
+// or later — too close to delivery to
+// cleanly unwind.
+// ========================================
+
+app.post("/api/errands/:id/cancel", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId, reason } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const errandResult = await pool.query(
+            `SELECT * FROM errands WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (errandResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Errand not found."
+            });
+
+        }
+
+        const errand =
+            errandResult.rows[0];
+
+        if (String(errand.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your errand."
+            });
+
+        }
+
+        const uncancellableStatuses =
+            ["on_way", "arrived", "completed", "cancelled", "failed"];
+
+        if (uncancellableStatuses.includes(errand.status)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "This errand is too far along to cancel — try messaging your agent instead."
+            });
+
+        }
+
+        let refundAmount = 0;
+
+        if (errand.status !== "pending") {
+            refundAmount += Number(errand.errand_fee);
+        }
+
+        if (errand.item_cost_status === "paid") {
+            refundAmount += Number(errand.item_cost);
+        }
+
+        if (refundAmount > 0) {
+
+            await pool.query(
+                `UPDATE students SET wallet_balance = COALESCE(wallet_balance, 0) + $1 WHERE id = $2`,
+                [refundAmount, studentId]
+            );
+
+        }
+
+        const updated = await pool.query(
+            `
+            UPDATE errands
+            SET status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP, cancellation_reason = $1
+            WHERE id = $2
+            RETURNING *
+            `,
+            [reason || "Cancelled by student", id]
+        );
+
+        res.status(200).json({
+            success: true,
+            errand: updated.rows[0],
+            refunded: refundAmount
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Cancel errand error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not cancel this errand."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ERRANDS — AGENT CANCEL
+// Returns the errand to the open pool for
+// another agent, rather than killing it
+// outright — and counts against the
+// agent's reliability record.
+// ========================================
+
+app.post("/api/errands/:id/agent-cancel", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const errandResult = await pool.query(
+            `SELECT * FROM errands WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (errandResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Errand not found."
+            });
+
+        }
+
+        const errand =
+            errandResult.rows[0];
+
+        if (String(errand.agent_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only the assigned agent can back out of this errand."
+            });
+
+        }
+
+        const uncancellableStatuses =
+            ["on_way", "arrived", "completed", "cancelled", "failed"];
+
+        if (uncancellableStatuses.includes(errand.status)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "This errand is too far along to back out of now."
+            });
+
+        }
+
+        const newOtp =
+            String(crypto.randomInt(1000, 9999));
+
+        const updated = await pool.query(
+            `
+            UPDATE errands
+            SET status = 'available', agent_id = NULL, accepted_at = NULL,
+                started_at = NULL, picked_up_at = NULL, delivery_otp = $1
+            WHERE id = $2
+            RETURNING *
+            `,
+            [newOtp, id]
+        );
+
+        await pool.query(
+            `
+            UPDATE students
+            SET errand_cancelled_count = COALESCE(errand_cancelled_count, 0) + 1
+            WHERE id = $1
+            `,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            errand: updated.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Agent cancel errand error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not back out of this errand."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ERRANDS — RATE THE AGENT
+// (only after completion, only once)
+// ========================================
+
+app.post("/api/errands/:id/rate", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId, rating, comment } = req.body;
+
+        if (!studentId || !rating || Number(rating) < 1 || Number(rating) > 5) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please give a rating between 1 and 5 stars."
+            });
+
+        }
+
+        const errandResult = await pool.query(
+            `SELECT * FROM errands WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (errandResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Errand not found."
+            });
+
+        }
+
+        const errand =
+            errandResult.rows[0];
+
+        if (String(errand.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your errand."
+            });
+
+        }
+
+        if (errand.status !== "completed") {
+
+            return res.status(400).json({
+                success: false,
+                message: "You can only rate a completed errand."
+            });
+
+        }
+
+        if (errand.rating) {
+
+            return res.status(400).json({
+                success: false,
+                message: "You've already rated this errand."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE errands SET rating = $1, rating_comment = $2 WHERE id = $3`,
+            [Number(rating), comment || null, id]
+        );
+
+        await pool.query(
+            `
+            UPDATE students
+            SET
+                errand_rating_total = COALESCE(errand_rating_total, 0) + $1,
+                errand_rating_count = COALESCE(errand_rating_count, 0) + 1
+            WHERE id = $2
+            `,
+            [Number(rating), errand.agent_id]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Thanks for rating your agent!"
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Rate errand error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not submit your rating."
         });
 
     }
