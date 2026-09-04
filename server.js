@@ -9724,6 +9724,58 @@ app.post("/api/craft-providers/verify", async (req, res) => {
 });
 
 
+app.get("/api/craft-providers/status", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const result = await pool.query(
+            `SELECT status, skills, bio FROM craft_providers WHERE student_id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(200).json({
+                success: true,
+                isRegistered: false
+            });
+
+        }
+
+        res.status(200).json({
+            success: true,
+            isRegistered: result.rows[0].status === "active",
+            skills: result.rows[0].skills,
+            bio: result.rows[0].bio
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch craft provider status error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your Craft provider status."
+        });
+
+    }
+
+});
+
 app.get("/api/students/errand-mode", async (req, res) => {
 
     try {
@@ -9740,7 +9792,7 @@ app.get("/api/students/errand-mode", async (req, res) => {
         }
 
         const result = await pool.query(
-            `SELECT errand_mode_available, errand_available_until, errand_service_area FROM students WHERE id = $1 LIMIT 1`,
+            `SELECT errand_mode_available, errand_available_until, errand_service_area, is_errand_agent_registered FROM students WHERE id = $1 LIMIT 1`,
             [studentId]
         );
 
@@ -9764,7 +9816,8 @@ app.get("/api/students/errand-mode", async (req, res) => {
             success: true,
             available: stillAvailable,
             availableUntil: student.errand_available_until,
-            serviceArea: student.errand_service_area
+            serviceArea: student.errand_service_area,
+            isRegistered: student.is_errand_agent_registered
         });
 
     } catch (error) {
