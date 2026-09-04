@@ -10339,6 +10339,116 @@ app.post("/api/craft-requests/:id/offers/:offerId/approve", async (req, res) => 
 });
 
 
+// ========================================
+// CRAFT REQUESTS — MY REQUESTS
+// (as the requesting student)
+// ========================================
+
+app.get("/api/craft-requests/my", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT
+                craft_requests.*,
+                (
+                    SELECT COUNT(*)::int FROM craft_offers
+                    WHERE request_id = craft_requests.id AND status = 'pending' AND is_counter = true
+                ) AS pending_offer_count
+            FROM craft_requests
+            WHERE student_id = $1
+            ORDER BY created_at DESC
+            `,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            requests: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch my craft requests error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your Craft requests."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRAFT REQUESTS — MY JOBS
+// (as the assigned provider)
+// ========================================
+
+app.get("/api/craft-requests/my-jobs", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT *
+            FROM craft_requests
+            WHERE assigned_provider_id = $1
+            AND status NOT IN ('completed', 'cancelled')
+            ORDER BY assigned_at DESC
+            `,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            requests: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch my craft jobs error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your Craft jobs."
+        });
+
+    }
+
+});
+
+
 app.get("/api/students/errand-mode", async (req, res) => {
 
     try {
