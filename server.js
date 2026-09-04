@@ -2273,6 +2273,58 @@ async function ensureErrandsSchemaExists() {
 
         await pool.query(
             `
+            CREATE TABLE IF NOT EXISTS craft_requests (
+                id SERIAL PRIMARY KEY,
+                request_code TEXT UNIQUE,
+                student_id INTEGER REFERENCES students(id),
+                skill TEXT NOT NULL,
+                description TEXT,
+                location TEXT NOT NULL,
+                proposed_price NUMERIC(12, 2) NOT NULL,
+                agreed_price NUMERIC(12, 2),
+                kurios_commission NUMERIC(12, 2),
+                provider_earnings NUMERIC(12, 2),
+                status TEXT NOT NULL DEFAULT 'open',
+                assigned_provider_id INTEGER REFERENCES students(id),
+                payment_reference TEXT UNIQUE,
+                payment_gateway TEXT,
+                transaction_reference TEXT,
+                conversation_id INTEGER REFERENCES conversations(id),
+                delivery_otp TEXT,
+                rating INTEGER,
+                rating_comment TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                assigned_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                cancelled_at TIMESTAMP
+            )
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS craft_offers (
+                id SERIAL PRIMARY KEY,
+                request_id INTEGER REFERENCES craft_requests(id),
+                provider_id INTEGER REFERENCES students(id),
+                offered_price NUMERIC(12, 2) NOT NULL,
+                is_counter BOOLEAN NOT NULL DEFAULT false,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (request_id, provider_id)
+            )
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE INDEX IF NOT EXISTS idx_craft_requests_status
+            ON craft_requests (status)
+            `
+        );
+
+        await pool.query(
+            `
             CREATE TABLE IF NOT EXISTS errands (
                 id SERIAL PRIMARY KEY,
                 errand_code TEXT UNIQUE,
@@ -9775,6 +9827,517 @@ app.get("/api/craft-providers/status", async (req, res) => {
     }
 
 });
+
+
+// ========================================
+// CRAFT REQUESTS — CREATE
+// (no payment yet — price isn't locked in
+// until a provider is actually confirmed,
+// since it may change through negotiation)
+// ========================================
+
+app.post("/api/craft-requests/create", async (req, res) => {
+
+    try {
+
+        const { studentId, skill, description, location, proposedPrice } = req.body;
+
+        if (!studentId || !skill || !location || !proposedPrice) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please fill in the skill, location, and your proposed price."
+            });
+
+        }
+
+        if (Number(proposedPrice) < 100) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Proposed price must be at least ₦100."
+            });
+
+        }
+
+        const requestCode =
+            "KRS-CFT-" + crypto.randomInt(10000, 99999);
+
+        const result = await pool.query(
+            `
+            INSERT INTO craft_requests (
+                request_code, student_id, skill, description, location, proposed_price, status
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 'open')
+            RETURNING *
+            `,
+            [requestCode, studentId, skill.trim(), description ? description.trim() : null, location.trim(), Number(proposedPrice)]
+        );
+
+        res.status(201).json({
+            success: true,
+            request: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Create craft request error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not create your request."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRAFT REQUESTS — PROVIDER DASHBOARD
+// (open requests matching the provider's
+// registered skills, plus ones they've
+// already made an offer on)
+// ========================================
+
+app.get("/api/craft-requests/dashboard", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const providerResult = await pool.query(
+            `SELECT skills, status FROM craft_providers WHERE student_id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (providerResult.rows.length === 0 || providerResult.rows[0].status !== "active") {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only registered Craft providers can view this dashboard."
+            });
+
+        }
+
+        const skills =
+            providerResult.rows[0].skills || [];
+
+        if (skills.length === 0) {
+
+            return res.status(200).json({
+                success: true,
+                requests: []
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT
+                craft_requests.*,
+                (
+                    SELECT offered_price FROM craft_offers
+                    WHERE request_id = craft_requests.id AND provider_id = $2
+                ) AS my_offer_price,
+                (
+                    SELECT status FROM craft_offers
+                    WHERE request_id = craft_requests.id AND provider_id = $2
+                ) AS my_offer_status
+            FROM craft_requests
+            WHERE craft_requests.status = 'open'
+            AND craft_requests.skill = ANY($1::text[])
+            AND craft_requests.student_id != $2
+            ORDER BY craft_requests.created_at ASC
+            `,
+            [skills, studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            requests: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch craft dashboard error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load the Craft Errands dashboard."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRAFT REQUESTS — MAKE AN OFFER
+// (accepting at the proposed price assigns
+// immediately, atomically — countering
+// requires the student to approve it)
+// ========================================
+
+app.post("/api/craft-requests/:id/offer", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId, offeredPrice } = req.body;
+
+        if (!studentId || !offeredPrice || Number(offeredPrice) < 100) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a valid price."
+            });
+
+        }
+
+        const providerResult = await pool.query(
+            `SELECT status FROM craft_providers WHERE student_id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (providerResult.rows.length === 0 || providerResult.rows[0].status !== "active") {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only registered Craft providers can make offers."
+            });
+
+        }
+
+        const requestResult = await pool.query(
+            `SELECT * FROM craft_requests WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (requestResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Request not found."
+            });
+
+        }
+
+        const craftRequest =
+            requestResult.rows[0];
+
+        if (craftRequest.status !== "open") {
+
+            return res.status(409).json({
+                success: false,
+                message: "This request is no longer open."
+            });
+
+        }
+
+        const isAcceptingProposedPrice =
+            Number(offeredPrice) === Number(craftRequest.proposed_price);
+
+        if (isAcceptingProposedPrice) {
+
+            // Accepting at face value assigns immediately,
+            // atomically — same locking pattern as regular
+            // errand accept, so two providers can't both win.
+
+            const deliveryOtp =
+                String(crypto.randomInt(1000, 9999));
+
+            const assignResult = await pool.query(
+                `
+                UPDATE craft_requests
+                SET status = 'assigned', assigned_provider_id = $1, agreed_price = $2, assigned_at = CURRENT_TIMESTAMP, delivery_otp = $3
+                WHERE id = $4 AND status = 'open'
+                RETURNING *
+                `,
+                [studentId, craftRequest.proposed_price, deliveryOtp, id]
+            );
+
+            if (assignResult.rows.length === 0) {
+
+                return res.status(409).json({
+                    success: false,
+                    message: "This request was just taken by another provider."
+                });
+
+            }
+
+            const assigned =
+                assignResult.rows[0];
+
+            const conversationId =
+                await findOrCreateConversation(assigned.student_id, studentId, "CRAFT", assigned.id);
+
+            await pool.query(
+                `UPDATE craft_requests SET conversation_id = $1 WHERE id = $2`,
+                [conversationId, assigned.id]
+            );
+
+            return res.status(200).json({
+                success: true,
+                assigned: true,
+                request: Object.assign({}, assigned, { conversation_id: conversationId })
+            });
+
+        }
+
+        // Otherwise it's a counter-offer — record it,
+        // request stays open, student must approve.
+
+        await pool.query(
+            `
+            INSERT INTO craft_offers (request_id, provider_id, offered_price, is_counter, status)
+            VALUES ($1, $2, $3, true, 'pending')
+            ON CONFLICT (request_id, provider_id)
+            DO UPDATE SET offered_price = EXCLUDED.offered_price, is_counter = true, status = 'pending'
+            `,
+            [id, studentId, Number(offeredPrice)]
+        );
+
+        res.status(200).json({
+            success: true,
+            assigned: false,
+            message: "Your counter-offer has been sent to the student."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Make craft offer error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not submit your offer."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRAFT REQUESTS — VIEW OFFERS
+// (student reviewing counter-offers on
+// their own request)
+// ========================================
+
+app.get("/api/craft-requests/:id/offers", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId } = req.query;
+
+        const requestResult = await pool.query(
+            `SELECT student_id FROM craft_requests WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (requestResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Request not found."
+            });
+
+        }
+
+        if (String(requestResult.rows[0].student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your request."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT
+                craft_offers.*,
+                students.first_name,
+                students.last_name
+            FROM craft_offers
+            JOIN students ON students.id = craft_offers.provider_id
+            WHERE craft_offers.request_id = $1
+            AND craft_offers.status = 'pending'
+            ORDER BY craft_offers.created_at ASC
+            `,
+            [id]
+        );
+
+        res.status(200).json({
+            success: true,
+            offers: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch craft offers error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load offers for this request."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRAFT REQUESTS — APPROVE A COUNTER-OFFER
+// (student picks one, atomically assigns
+// that provider and rejects the rest)
+// ========================================
+
+app.post("/api/craft-requests/:id/offers/:offerId/approve", async (req, res) => {
+
+    try {
+
+        const { id, offerId } = req.params;
+        const { studentId } = req.body;
+
+        const requestResult = await pool.query(
+            `SELECT * FROM craft_requests WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (requestResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Request not found."
+            });
+
+        }
+
+        const craftRequest =
+            requestResult.rows[0];
+
+        if (String(craftRequest.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your request."
+            });
+
+        }
+
+        if (craftRequest.status !== "open") {
+
+            return res.status(409).json({
+                success: false,
+                message: "This request is no longer open."
+            });
+
+        }
+
+        const offerResult = await pool.query(
+            `SELECT * FROM craft_offers WHERE id = $1 AND request_id = $2 AND status = 'pending' LIMIT 1`,
+            [offerId, id]
+        );
+
+        if (offerResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "That offer is no longer available."
+            });
+
+        }
+
+        const offer =
+            offerResult.rows[0];
+
+        const deliveryOtp =
+            String(crypto.randomInt(1000, 9999));
+
+        const assignResult = await pool.query(
+            `
+            UPDATE craft_requests
+            SET status = 'assigned', assigned_provider_id = $1, agreed_price = $2, assigned_at = CURRENT_TIMESTAMP, delivery_otp = $3
+            WHERE id = $4 AND status = 'open'
+            RETURNING *
+            `,
+            [offer.provider_id, offer.offered_price, deliveryOtp, id]
+        );
+
+        if (assignResult.rows.length === 0) {
+
+            return res.status(409).json({
+                success: false,
+                message: "This request is no longer open."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE craft_offers SET status = 'approved' WHERE id = $1`,
+            [offerId]
+        );
+
+        await pool.query(
+            `UPDATE craft_offers SET status = 'rejected' WHERE request_id = $1 AND id != $2 AND status = 'pending'`,
+            [id, offerId]
+        );
+
+        const assigned =
+            assignResult.rows[0];
+
+        const conversationId =
+            await findOrCreateConversation(assigned.student_id, offer.provider_id, "CRAFT", assigned.id);
+
+        await pool.query(
+            `UPDATE craft_requests SET conversation_id = $1 WHERE id = $2`,
+            [conversationId, assigned.id]
+        );
+
+        res.status(200).json({
+            success: true,
+            request: Object.assign({}, assigned, { conversation_id: conversationId })
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Approve craft offer error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not approve this offer."
+        });
+
+    }
+
+});
+
 
 app.get("/api/students/errand-mode", async (req, res) => {
 
