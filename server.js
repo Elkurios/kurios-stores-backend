@@ -40,6 +40,12 @@ app.use(express.json());
 */
 
 const MONNIFY_API_KEY = process.env.MONNIFY_API_KEY;
+
+// Flat fee for choosing Errand Delivery at Shop checkout.
+// A simple starting point — could later become distance-
+// based like regular errands, but a flat fee keeps this
+// predictable for a first version.
+const ERRAND_DELIVERY_FLAT_FEE = 300;
 const MONNIFY_SECRET_KEY = process.env.MONNIFY_SECRET_KEY;
 const MONNIFY_CONTRACT_CODE = process.env.MONNIFY_CONTRACT_CODE;
 const MONNIFY_BASE_URL =
@@ -905,6 +911,48 @@ async function ensureOrdersTableExists() {
             `
             ALTER TABLE orders
             ADD COLUMN IF NOT EXISTS payment_gateway TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS delivery_method TEXT DEFAULT 'pickup'
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS delivery_location TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS delivery_lat NUMERIC(10, 6)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS delivery_lng NUMERIC(10, 6)
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS delivery_fee NUMERIC(12, 2) DEFAULT 0
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS errand_id INTEGER
             `
         );
 
@@ -5220,6 +5268,25 @@ async function applyOrderPaymentResult(order, isPaid, isFailed, transactionRefer
 
         }
 
+        if (updatedResult.rows[0].delivery_method === "errand") {
+
+            try {
+
+                await createShopDeliveryErrand(
+                    updatedResult.rows[0]
+                );
+
+            } catch (error) {
+
+                console.error(
+                    "Shop delivery errand creation error:",
+                    error.message
+                );
+
+            }
+
+        }
+
     }
 
     return {
@@ -5334,6 +5401,95 @@ async function creditSellersForOrder(order) {
         );
 
     }
+
+}
+
+
+async function createShopDeliveryErrand(order) {
+
+    let items = [];
+
+    try {
+
+        items =
+            typeof order.items === "string" ?
+                JSON.parse(order.items) :
+                order.items;
+
+    } catch (error) {
+        return;
+    }
+
+    if (!items || items.length === 0) return;
+
+    const productIds =
+        items.map(function (item) { return item.id; });
+
+    const sellerResult = await pool.query(
+        `
+        SELECT DISTINCT sellers.store_name
+        FROM products
+        JOIN sellers ON sellers.id = products.seller_id
+        WHERE products.id = ANY($1::int[])
+        LIMIT 1
+        `,
+        [productIds]
+    );
+
+    const storeName =
+        sellerResult.rows.length > 0 ? sellerResult.rows[0].store_name : "Kurios Stores seller";
+
+    const errandFee =
+        Number(order.delivery_fee || ERRAND_DELIVERY_FLAT_FEE);
+
+    const commission =
+        Math.round(errandFee * 0.20 * 100) / 100;
+
+    const agentEarnings =
+        errandFee - commission;
+
+    const productCost =
+        Number(order.amount) - errandFee;
+
+    const errandCode =
+        "KRS-ERR-" + crypto.randomInt(10000, 99999);
+
+    const deliveryOtp =
+        String(crypto.randomInt(1000, 9999));
+
+    const paymentReference =
+        "kurios_shopdelivery_" + order.id;
+
+    const errandResult = await pool.query(
+        `
+        INSERT INTO errands (
+            errand_code, student_id, title, pickup_location, destination, description,
+            item_cost, item_cost_status, errand_fee, total_amount, kurios_commission, agent_earnings,
+            status, payment_reference, transaction_reference, is_shop_delivery, order_id,
+            destination_lat, destination_lng, delivery_otp
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'paid', $8, $9, $10, $11, 'available', $12, $13, true, $14, $15, $16, $17)
+        RETURNING id
+        `,
+        [
+            errandCode, order.student_id, "Deliver order #" + order.id, storeName,
+            order.delivery_location, "Shop order delivery — items already paid for.",
+            productCost, errandFee, order.amount, commission, agentEarnings,
+            paymentReference, order.transaction_reference, order.id,
+            order.delivery_lat || null, order.delivery_lng || null, deliveryOtp
+        ]
+    );
+
+    await pool.query(
+        `UPDATE orders SET errand_id = $1 WHERE id = $2`,
+        [errandResult.rows[0].id, order.id]
+    );
+
+    await createUserNotification(
+        order.student_id,
+        "Delivery requested",
+        "Your order is now available for an agent to pick up and deliver."
+    );
 
 }
 
@@ -5536,7 +5692,11 @@ app.post("/api/orders/initiate", async (req, res) => {
             studentId,
             items,
             customerName,
-            customerEmail
+            customerEmail,
+            deliveryMethod,
+            deliveryLocation,
+            deliveryLat,
+            deliveryLng
         } = req.body;
 
         if (
@@ -5587,6 +5747,57 @@ app.post("/api/orders/initiate", async (req, res) => {
 
         }
 
+        const wantsErrandDelivery =
+            deliveryMethod === "errand";
+
+        let deliveryFee = 0;
+        let sellerStudentIdForDelivery = null;
+
+        if (wantsErrandDelivery) {
+
+            if (!deliveryLocation) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Please provide a delivery location."
+                });
+
+            }
+
+            // Errand delivery only supports a single-seller
+            // cart for now — an order spanning multiple
+            // stores would need one errand per seller,
+            // which isn't built yet.
+
+            const productIds =
+                trustedItems.map(function (item) { return item.id; });
+
+            const sellerCheck = await pool.query(
+                `
+                SELECT DISTINCT sellers.id AS seller_id, sellers.student_id AS seller_student_id
+                FROM products
+                JOIN sellers ON sellers.id = products.seller_id
+                WHERE products.id = ANY($1::int[])
+                `,
+                [productIds]
+            );
+
+            if (sellerCheck.rows.length !== 1) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Errand delivery is only available for orders from a single seller right now."
+                });
+
+            }
+
+            sellerStudentIdForDelivery =
+                sellerCheck.rows[0].seller_student_id;
+
+            deliveryFee = ERRAND_DELIVERY_FLAT_FEE;
+            totalAmount += deliveryFee;
+
+        }
 
         const paymentReference =
             "kurios_" +
@@ -5601,15 +5812,25 @@ app.post("/api/orders/initiate", async (req, res) => {
                 payment_reference,
                 items,
                 amount,
-                status
+                status,
+                delivery_method,
+                delivery_location,
+                delivery_lat,
+                delivery_lng,
+                delivery_fee
             )
-            VALUES ($1, $2, $3, $4, 'pending')
+            VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9)
             `,
             [
                 studentId,
                 paymentReference,
                 JSON.stringify(trustedItems),
-                totalAmount
+                totalAmount,
+                wantsErrandDelivery ? "errand" : "pickup",
+                deliveryLocation || null,
+                deliveryLat || null,
+                deliveryLng || null,
+                deliveryFee
             ]
         );
 
