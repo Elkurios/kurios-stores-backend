@@ -2173,6 +2173,41 @@ async function ensureErrandsSchemaExists() {
 
         await pool.query(
             `
+            ALTER TABLE errands
+            ADD COLUMN IF NOT EXISTS item_cost_status TEXT DEFAULT 'none'
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE errands
+            ADD COLUMN IF NOT EXISTS item_cost_payment_reference TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE errands
+            ADD COLUMN IF NOT EXISTS item_cost_payment_gateway TEXT
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE errands
+            ADD COLUMN IF NOT EXISTS is_shop_delivery BOOLEAN DEFAULT false
+            `
+        );
+
+        await pool.query(
+            `
+            ALTER TABLE errands
+            ADD COLUMN IF NOT EXISTS order_id INTEGER
+            `
+        );
+
+        await pool.query(
+            `
             CREATE TABLE IF NOT EXISTS errands (
                 id SERIAL PRIMARY KEY,
                 errand_code TEXT UNIQUE,
@@ -5683,6 +5718,12 @@ async function routeWebhookVerification(paymentReference) {
 
     }
 
+    if (paymentReference.startsWith("kurios_errand_item_")) {
+
+        return await verifyAndUpdateErrandItemCostPayment(paymentReference);
+
+    }
+
     if (paymentReference.startsWith("kurios_errand_")) {
 
         return await verifyAndUpdateErrandPayment(paymentReference);
@@ -8397,7 +8438,7 @@ app.post("/api/errands/create", async (req, res) => {
 
         }
 
-        const itemCostAmount =
+        const itemCostEstimate =
             itemCost ? Number(itemCost) : 0;
 
         const errandFeeAmount =
@@ -8409,8 +8450,13 @@ app.post("/api/errands/create", async (req, res) => {
         const agentEarnings =
             errandFeeAmount - commission;
 
+        // Only the errand fee is charged now — the item
+        // cost (if any) isn't known precisely until the
+        // agent is actually at the store, so it's collected
+        // separately once they report the real figure.
+
         const totalAmount =
-            itemCostAmount + errandFeeAmount;
+            errandFeeAmount;
 
         const paymentReference =
             "kurios_errand_" + Date.now() + "_" + crypto.randomInt(100000, 999999);
@@ -8430,7 +8476,7 @@ app.post("/api/errands/create", async (req, res) => {
             `,
             [
                 errandCode, studentId, title.trim(), pickupLocation.trim(), destination.trim(),
-                description ? description.trim() : null, itemCostAmount, errandFeeAmount,
+                description ? description.trim() : null, itemCostEstimate, errandFeeAmount,
                 totalAmount, commission, agentEarnings, paymentReference
             ]
         );
@@ -9039,14 +9085,17 @@ app.post("/api/errands/:id/accept", async (req, res) => {
 
         }
 
+        const deliveryOtp =
+            String(crypto.randomInt(1000, 9999));
+
         const claimResult = await pool.query(
             `
             UPDATE errands
-            SET status = 'accepted', agent_id = $1, accepted_at = CURRENT_TIMESTAMP
+            SET status = 'accepted', agent_id = $1, accepted_at = CURRENT_TIMESTAMP, delivery_otp = $3
             WHERE id = $2 AND status = 'available' AND agent_id IS NULL AND student_id != $1
             RETURNING *
             `,
-            [studentId, id]
+            [studentId, id, deliveryOtp]
         );
 
         if (claimResult.rows.length === 0) {
@@ -9139,6 +9188,633 @@ app.get("/api/errands/my", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Could not load your errand requests."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ERRANDS — AGENT REPORTS THE ACTUAL
+// ITEM COST (once known, at the store)
+// ========================================
+
+app.post("/api/errands/:id/report-item-cost", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId, itemCost } = req.body;
+
+        if (!studentId || !itemCost || Number(itemCost) <= 0) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a valid item cost."
+            });
+
+        }
+
+        const errandResult = await pool.query(
+            `SELECT * FROM errands WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (errandResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Errand not found."
+            });
+
+        }
+
+        const errand =
+            errandResult.rows[0];
+
+        if (String(errand.agent_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only the assigned agent can report the item cost."
+            });
+
+        }
+
+        if (!["accepted", "in_progress"].includes(errand.status)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "This errand isn't in a stage where item cost can be reported."
+            });
+
+        }
+
+        const itemCostReference =
+            "kurios_errand_item_" + Date.now() + "_" + crypto.randomInt(100000, 999999);
+
+        const updated = await pool.query(
+            `
+            UPDATE errands
+            SET item_cost = $1, item_cost_status = 'awaiting_payment', item_cost_payment_reference = $2
+            WHERE id = $3
+            RETURNING *
+            `,
+            [Number(itemCost), itemCostReference, id]
+        );
+
+        if (errand.conversation_id) {
+
+            await pool.query(
+                `
+                INSERT INTO messages (sender_id, recipient_id, body, conversation_id, message_type)
+                VALUES ($1, $2, $3, $4, 'TEXT')
+                `,
+                [
+                    studentId,
+                    errand.student_id,
+                    "The item cost came to ₦" + Number(itemCost).toLocaleString() + ". Please pay this in the Errands page so I can go ahead.",
+                    errand.conversation_id
+                ]
+            );
+
+            if (typeof io !== "undefined") {
+
+                io.to("student:" + errand.student_id).emit(
+                    "new_message",
+                    { conversation_id: errand.conversation_id }
+                );
+
+            }
+
+        }
+
+        res.status(200).json({
+            success: true,
+            errand: updated.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Report item cost error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not report the item cost."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ERRANDS — STUDENT PAYS THE REPORTED
+// ITEM COST
+// ========================================
+
+app.post("/api/errands/:id/pay-item-cost/:gateway", async (req, res) => {
+
+    try {
+
+        const { id, gateway } = req.params;
+        const { returnUrl, customerName, customerEmail } = req.body;
+
+        const errandResult = await pool.query(
+            `SELECT * FROM errands WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (errandResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Errand not found."
+            });
+
+        }
+
+        const errand =
+            errandResult.rows[0];
+
+        if (errand.item_cost_status !== "awaiting_payment") {
+
+            return res.status(400).json({
+                success: false,
+                message: "There's no item cost awaiting payment on this errand."
+            });
+
+        }
+
+        const paymentReference =
+            errand.item_cost_payment_reference;
+
+        await pool.query(
+            `UPDATE errands SET item_cost_payment_gateway = $1 WHERE id = $2`,
+            [gateway, errand.id]
+        );
+
+        if (gateway === "monnify") {
+
+            return res.status(200).json({
+                success: true,
+                paymentReference: paymentReference,
+                amount: Number(errand.item_cost),
+                apiKey: MONNIFY_API_KEY,
+                contractCode: MONNIFY_CONTRACT_CODE
+            });
+
+        }
+
+        if (gateway === "opay") {
+
+            const opayData =
+                await createOpayCashierPayment({
+                    reference: paymentReference,
+                    amountNaira: Number(errand.item_cost),
+                    customerName: customerName || "Kurios Student",
+                    customerEmail: customerEmail || "",
+                    description: "Kurios Stores errand item cost — " + errand.title,
+                    returnUrl: returnUrl,
+                    callbackUrl: OPAY_CALLBACK_URL
+                });
+
+            return res.status(200).json({
+                success: true,
+                cashierUrl: opayData.cashierUrl
+            });
+
+        }
+
+        if (gateway === "paystack") {
+
+            const paystackData =
+                await initializePaystackTransaction({
+                    reference: paymentReference,
+                    amountNaira: Number(errand.item_cost),
+                    email: customerEmail,
+                    callbackUrl: returnUrl
+                });
+
+            return res.status(200).json({
+                success: true,
+                authorizationUrl: paystackData.authorization_url
+            });
+
+        }
+
+        res.status(400).json({
+            success: false,
+            message: "Unknown payment gateway."
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Errand item cost checkout error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: error.message || "Could not start checkout."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ERRANDS — VERIFY ITEM COST PAYMENT
+// ========================================
+
+async function verifyAndUpdateErrandItemCostPayment(paymentReference) {
+
+    const errandResult = await pool.query(
+        `SELECT * FROM errands WHERE item_cost_payment_reference = $1 LIMIT 1`,
+        [paymentReference]
+    );
+
+    if (errandResult.rows.length === 0) {
+
+        return {
+            success: false,
+            message: "Errand not found.",
+            errand: null
+        };
+
+    }
+
+    const errand =
+        errandResult.rows[0];
+
+    if (errand.item_cost_status === "paid") {
+
+        return {
+            success: true,
+            message: "Item cost already confirmed.",
+            errand: errand
+        };
+
+    }
+
+    let isPaid = false;
+
+    try {
+
+        if (errand.item_cost_payment_gateway === "opay") {
+
+            const opayData =
+                await queryOpayPaymentStatus(paymentReference);
+
+            isPaid =
+                opayData.status === "SUCCESS" &&
+                Number(opayData.amount.total) >= Math.round(Number(errand.item_cost) * 100);
+
+        } else if (errand.item_cost_payment_gateway === "paystack") {
+
+            const paystackData =
+                await verifyPaystackTransaction(paymentReference);
+
+            isPaid =
+                paystackData.status === "success" &&
+                Number(paystackData.amount) >= Math.round(Number(errand.item_cost) * 100);
+
+        } else {
+
+            const accessToken =
+                await getMonnifyAccessToken();
+
+            const verifyResponse = await fetch(
+                MONNIFY_BASE_URL +
+                "/api/v2/merchant/transactions/query?paymentReference=" +
+                encodeURIComponent(paymentReference),
+                {
+                    headers: { "Authorization": "Bearer " + accessToken },
+                    signal: AbortSignal.timeout(15000)
+                }
+            );
+
+            const verifyData = await verifyResponse.json();
+
+            if (verifyData.requestSuccessful) {
+
+                const paymentStatus =
+                    verifyData.responseBody.paymentStatus;
+
+                const amountPaid =
+                    Number(verifyData.responseBody.amountPaid || 0);
+
+                isPaid =
+                    (paymentStatus === "PAID" || paymentStatus === "OVERPAID") &&
+                    amountPaid >= Number(errand.item_cost);
+
+            }
+
+        }
+
+    } catch (error) {
+
+        return {
+            success: false,
+            message: "Could not verify this payment.",
+            errand: errand
+        };
+
+    }
+
+    if (!isPaid) {
+
+        return {
+            success: false,
+            message: "Payment not yet confirmed.",
+            errand: errand
+        };
+
+    }
+
+    const updated = await pool.query(
+        `UPDATE errands SET item_cost_status = 'paid' WHERE id = $1 RETURNING *`,
+        [errand.id]
+    );
+
+    return {
+        success: true,
+        message: "Item cost payment confirmed.",
+        errand: updated.rows[0]
+    };
+
+}
+
+app.post("/api/errands/item-cost/verify", async (req, res) => {
+
+    try {
+
+        const { paymentReference } = req.body;
+
+        if (!paymentReference) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference."
+            });
+
+        }
+
+        const result =
+            await verifyAndUpdateErrandItemCostPayment(paymentReference);
+
+        if (!result.errand) {
+            return res.status(404).json(result);
+        }
+
+        res.status(200).json(result);
+
+    } catch (error) {
+
+        console.error(
+            "Errand item cost verify error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Something went wrong while verifying this payment."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ERRANDS — EXECUTION STATUS TRANSITIONS
+// (agent-only, ownership-checked, and each
+// only allowed from its correct prior state
+// so steps can't be skipped or reordered)
+// ========================================
+
+const ERRAND_STATUS_TRANSITIONS = {
+    start: { from: "accepted", to: "in_progress", column: "started_at" },
+    "picked-up": { from: "in_progress", to: "picked_up", column: "picked_up_at" },
+    "on-way": { from: "picked_up", to: "on_way", column: "on_way_at" },
+    arrived: { from: "on_way", to: "arrived", column: "arrived_at" }
+};
+
+async function handleErrandStatusTransition(action, req, res) {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId } = req.body;
+
+        const transition =
+            ERRAND_STATUS_TRANSITIONS[action];
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const errandResult = await pool.query(
+            `SELECT * FROM errands WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (errandResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Errand not found."
+            });
+
+        }
+
+        const errand =
+            errandResult.rows[0];
+
+        if (String(errand.agent_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only the assigned agent can update this errand."
+            });
+
+        }
+
+        if (errand.status !== transition.from) {
+
+            return res.status(400).json({
+                success: false,
+                message: "This errand isn't at the right stage for that action."
+            });
+
+        }
+
+        const updated = await pool.query(
+            `
+            UPDATE errands
+            SET status = $1, ${transition.column} = CURRENT_TIMESTAMP
+            WHERE id = $2
+            RETURNING *
+            `,
+            [transition.to, id]
+        );
+
+        res.status(200).json({
+            success: true,
+            errand: updated.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Update errand status error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not update this errand."
+        });
+
+    }
+
+}
+
+app.post("/api/errands/:id/start", (req, res) => handleErrandStatusTransition("start", req, res));
+app.post("/api/errands/:id/picked-up", (req, res) => handleErrandStatusTransition("picked-up", req, res));
+app.post("/api/errands/:id/on-way", (req, res) => handleErrandStatusTransition("on-way", req, res));
+app.post("/api/errands/:id/arrived", (req, res) => handleErrandStatusTransition("arrived", req, res));
+
+
+// ========================================
+// ERRANDS — CONFIRM DELIVERY (OTP)
+// This is the escrow release point — the
+// student's OTP is the confirmation from
+// both sides: the agent physically handed
+// it over, and the student gave the code.
+// ========================================
+
+app.post("/api/errands/:id/confirm-delivery", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId, otp } = req.body;
+
+        if (!studentId || !otp) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please enter the delivery code."
+            });
+
+        }
+
+        const errandResult = await pool.query(
+            `SELECT * FROM errands WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (errandResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Errand not found."
+            });
+
+        }
+
+        const errand =
+            errandResult.rows[0];
+
+        if (String(errand.agent_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "Only the assigned agent can confirm delivery."
+            });
+
+        }
+
+        if (errand.status !== "arrived") {
+
+            return res.status(400).json({
+                success: false,
+                message: "Mark the errand as arrived before confirming delivery."
+            });
+
+        }
+
+        if (String(otp).trim() !== String(errand.delivery_otp)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "That code doesn't match. Please check with the student."
+            });
+
+        }
+
+        // Release earnings: the errand fee's agent share,
+        // plus a full reimbursement of the item cost if one
+        // was reported and actually paid through the app.
+
+        const itemCostReimbursement =
+            errand.item_cost_status === "paid" ? Number(errand.item_cost) : 0;
+
+        const totalRelease =
+            Number(errand.agent_earnings) + itemCostReimbursement;
+
+        await pool.query(
+            `UPDATE students SET wallet_balance = COALESCE(wallet_balance, 0) + $1 WHERE id = $2`,
+            [totalRelease, errand.agent_id]
+        );
+
+        await pool.query(
+            `
+            UPDATE students
+            SET errand_completed_count = COALESCE(errand_completed_count, 0) + 1
+            WHERE id = $1
+            `,
+            [errand.agent_id]
+        );
+
+        const updated = await pool.query(
+            `
+            UPDATE errands
+            SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            RETURNING *
+            `,
+            [id]
+        );
+
+        res.status(200).json({
+            success: true,
+            errand: updated.rows[0],
+            released: totalRelease
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Confirm delivery error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not confirm delivery."
         });
 
     }
