@@ -1248,6 +1248,22 @@ async function ensureNotificationsTableExists() {
             "Notifications table is ready."
         );
 
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS user_notifications (
+                id SERIAL PRIMARY KEY,
+                student_id INTEGER REFERENCES students(id),
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        console.log(
+            "User notifications table is ready."
+        );
+
     } catch (error) {
 
         console.error(
@@ -7419,6 +7435,78 @@ app.get("/api/notifications", async (req, res) => {
 
 
 // ========================================
+// PERSONAL NOTIFICATIONS
+// ========================================
+
+async function createUserNotification(studentId, title, message) {
+
+    try {
+
+        await pool.query(
+            `INSERT INTO user_notifications (student_id, title, message) VALUES ($1, $2, $3)`,
+            [studentId, title, message]
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Create user notification error:",
+            error.message
+        );
+
+    }
+
+}
+
+app.get("/api/notifications/mine", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.query;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            SELECT id, title, message, created_at
+            FROM user_notifications
+            WHERE student_id = $1
+            ORDER BY created_at DESC
+            LIMIT 20
+            `,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            notifications: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch personal notifications error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load your notifications."
+        });
+
+    }
+
+});
+
+
+// ========================================
 // ADMIN — SEND AN ANNOUNCEMENT TO ALL STUDENTS
 // ========================================
 
@@ -9951,6 +10039,13 @@ app.get("/api/craft-requests/dashboard", async (req, res) => {
 
         }
 
+        const { sort } = req.query;
+
+        const orderClause =
+            sort === "fee" ?
+                "ORDER BY craft_requests.proposed_price DESC" :
+                "ORDER BY craft_requests.created_at ASC";
+
         const result = await pool.query(
             `
             SELECT
@@ -9967,7 +10062,7 @@ app.get("/api/craft-requests/dashboard", async (req, res) => {
             WHERE craft_requests.status = 'open'
             AND craft_requests.skill = ANY($1::text[])
             AND craft_requests.student_id != $2
-            ORDER BY craft_requests.created_at ASC
+            ${orderClause}
             `,
             [skills, studentId]
         );
@@ -10108,6 +10203,12 @@ app.post("/api/craft-requests/:id/offer", async (req, res) => {
                 [conversationId, assigned.id]
             );
 
+            await createUserNotification(
+                assigned.student_id,
+                "Craft request accepted",
+                "Your \"" + assigned.skill + "\" request (" + assigned.request_code + ") has been accepted by a provider."
+            );
+
             return res.status(200).json({
                 success: true,
                 assigned: true,
@@ -10127,6 +10228,12 @@ app.post("/api/craft-requests/:id/offer", async (req, res) => {
             DO UPDATE SET offered_price = EXCLUDED.offered_price, is_counter = true, status = 'pending'
             `,
             [id, studentId, Number(offeredPrice)]
+        );
+
+        await createUserNotification(
+            craftRequest.student_id,
+            "New offer received",
+            "A provider offered ₦" + Number(offeredPrice).toLocaleString() + " on your \"" + craftRequest.skill + "\" request."
         );
 
         res.status(200).json({
@@ -10340,6 +10447,12 @@ app.post("/api/craft-requests/:id/offers/:offerId/approve", async (req, res) => 
         await pool.query(
             `UPDATE craft_requests SET conversation_id = $1 WHERE id = $2`,
             [conversationId, assigned.id]
+        );
+
+        await createUserNotification(
+            offer.provider_id,
+            "Offer approved",
+            "Your offer of ₦" + Number(offer.offered_price).toLocaleString() + " on \"" + assigned.skill + "\" (" + assigned.request_code + ") was approved!"
         );
 
         res.status(200).json({
@@ -10731,6 +10844,12 @@ async function verifyAndUpdateCraftRequestPayment(paymentReference) {
         [transactionReference, craftRequest.id]
     );
 
+    await createUserNotification(
+        craftRequest.assigned_provider_id,
+        "Payment received",
+        "The student paid for \"" + craftRequest.skill + "\" (" + craftRequest.request_code + ") — you can start whenever ready."
+    );
+
     return {
         success: true,
         message: "Payment confirmed.",
@@ -10841,6 +10960,12 @@ app.post("/api/craft-requests/:id/start", async (req, res) => {
             [id]
         );
 
+        await createUserNotification(
+            craftRequest.student_id,
+            "Service started",
+            "Your provider has started your \"" + craftRequest.skill + "\" service."
+        );
+
         res.status(200).json({
             success: true,
             request: updated.rows[0]
@@ -10940,6 +11065,18 @@ app.post("/api/craft-requests/:id/confirm-completion", async (req, res) => {
             RETURNING *
             `,
             [id]
+        );
+
+        await createUserNotification(
+            craftRequest.student_id,
+            "Craft service completed",
+            "Your \"" + craftRequest.skill + "\" request (" + craftRequest.request_code + ") has been completed."
+        );
+
+        await createUserNotification(
+            craftRequest.assigned_provider_id,
+            "Craft job completed",
+            "You earned ₦" + Number(craftRequest.provider_earnings).toLocaleString() + " for \"" + craftRequest.skill + "\"."
         );
 
         res.status(200).json({
@@ -11054,6 +11191,16 @@ app.post("/api/craft-requests/:id/cancel", async (req, res) => {
             [id]
         );
 
+        if (craftRequest.assigned_provider_id) {
+
+            await createUserNotification(
+                craftRequest.assigned_provider_id,
+                "Craft request cancelled",
+                "The student cancelled \"" + craftRequest.skill + "\" (" + craftRequest.request_code + ")."
+            );
+
+        }
+
         res.status(200).json({
             success: true,
             request: updated.rows[0],
@@ -11155,6 +11302,12 @@ app.post("/api/craft-requests/:id/rate", async (req, res) => {
             WHERE id = $2
             `,
             [Number(rating), craftRequest.assigned_provider_id]
+        );
+
+        await createUserNotification(
+            craftRequest.assigned_provider_id,
+            "You've been rated",
+            "The student gave you " + rating + " star" + (Number(rating) === 1 ? "" : "s") + " for \"" + craftRequest.skill + "\"."
         );
 
         res.status(200).json({
@@ -11381,6 +11534,13 @@ app.get("/api/errands/pool", async (req, res) => {
 
         }
 
+        const { sort } = req.query;
+
+        const orderClause =
+            sort === "fee" ?
+                "ORDER BY errand_fee DESC" :
+                "ORDER BY created_at ASC";
+
         const result = await pool.query(
             `
             SELECT
@@ -11389,7 +11549,7 @@ app.get("/api/errands/pool", async (req, res) => {
             FROM errands
             WHERE status = 'available'
             AND student_id != $1
-            ORDER BY created_at ASC
+            ${orderClause}
             LIMIT 30
             `,
             [studentId]
@@ -11515,6 +11675,12 @@ app.post("/api/errands/:id/accept", async (req, res) => {
         await pool.query(
             `UPDATE errands SET conversation_id = $1 WHERE id = $2`,
             [conversationId, errand.id]
+        );
+
+        await createUserNotification(
+            errand.student_id,
+            "Errand accepted",
+            "Your errand \"" + errand.title + "\" (" + errand.errand_code + ") has been accepted by an agent."
         );
 
         res.status(200).json({
@@ -11738,6 +11904,12 @@ app.post("/api/errands/:id/report-item-cost", async (req, res) => {
             }
 
         }
+
+        await createUserNotification(
+            errand.student_id,
+            "Item cost reported",
+            "Your agent reported an item cost of ₦" + Number(itemCost).toLocaleString() + " for \"" + errand.title + "\" — please pay to continue."
+        );
 
         res.status(200).json({
             success: true,
@@ -11992,6 +12164,16 @@ async function verifyAndUpdateErrandItemCostPayment(paymentReference) {
         [errand.id]
     );
 
+    if (errand.agent_id) {
+
+        await createUserNotification(
+            errand.agent_id,
+            "Item cost paid",
+            "The student paid the ₦" + Number(errand.item_cost).toLocaleString() + " item cost for \"" + errand.title + "\"."
+        );
+
+    }
+
     return {
         success: true,
         message: "Item cost payment confirmed.",
@@ -12053,6 +12235,13 @@ const ERRAND_STATUS_TRANSITIONS = {
     "picked-up": { from: "in_progress", to: "picked_up", column: "picked_up_at" },
     "on-way": { from: "picked_up", to: "on_way", column: "on_way_at" },
     arrived: { from: "on_way", to: "arrived", column: "arrived_at" }
+};
+
+const ERRAND_STATUS_NOTIFICATION_MESSAGE = {
+    in_progress: "Your agent has started your errand.",
+    picked_up: "Your agent picked up your item.",
+    on_way: "Your agent is on the way.",
+    arrived: "Your agent has arrived."
 };
 
 async function handleErrandStatusTransition(action, req, res) {
@@ -12117,6 +12306,12 @@ async function handleErrandStatusTransition(action, req, res) {
             RETURNING *
             `,
             [transition.to, id]
+        );
+
+        await createUserNotification(
+            updated.rows[0].student_id,
+            "Errand update",
+            ERRAND_STATUS_NOTIFICATION_MESSAGE[transition.to] || "Your errand status was updated."
         );
 
         res.status(200).json({
@@ -12248,6 +12443,18 @@ app.post("/api/errands/:id/confirm-delivery", async (req, res) => {
             [id]
         );
 
+        await createUserNotification(
+            errand.student_id,
+            "Errand completed",
+            "Your errand \"" + errand.title + "\" (" + errand.errand_code + ") has been completed."
+        );
+
+        await createUserNotification(
+            errand.agent_id,
+            "Errand completed",
+            "You earned ₦" + totalRelease.toLocaleString() + " for completing \"" + errand.title + "\"."
+        );
+
         res.status(200).json({
             success: true,
             errand: updated.rows[0],
@@ -12363,6 +12570,16 @@ app.post("/api/errands/:id/cancel", async (req, res) => {
             [reason || "Cancelled by student", id]
         );
 
+        if (errand.agent_id) {
+
+            await createUserNotification(
+                errand.agent_id,
+                "Errand cancelled",
+                "The student cancelled \"" + errand.title + "\" (" + errand.errand_code + ")."
+            );
+
+        }
+
         res.status(200).json({
             success: true,
             errand: updated.rows[0],
@@ -12471,6 +12688,12 @@ app.post("/api/errands/:id/agent-cancel", async (req, res) => {
             [studentId]
         );
 
+        await createUserNotification(
+            errand.student_id,
+            "Agent backed out",
+            "Your agent backed out of \"" + errand.title + "\" (" + errand.errand_code + ") — it's back in the pool for another agent."
+        );
+
         res.status(200).json({
             success: true,
             errand: updated.rows[0]
@@ -12572,6 +12795,12 @@ app.post("/api/errands/:id/rate", async (req, res) => {
             WHERE id = $2
             `,
             [Number(rating), errand.agent_id]
+        );
+
+        await createUserNotification(
+            errand.agent_id,
+            "You've been rated",
+            "The student gave you " + rating + " star" + (Number(rating) === 1 ? "" : "s") + " for \"" + errand.title + "\"."
         );
 
         res.status(200).json({
