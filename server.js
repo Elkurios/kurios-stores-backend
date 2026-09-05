@@ -12045,6 +12045,88 @@ app.post("/api/craft-requests/:id/pay/:gateway", async (req, res) => {
         // student. A new reference means every attempt starts
         // clean.
 
+        // Before starting a fresh checkout, check whether the
+        // existing reference already succeeded on the gateway's
+        // side — this is exactly the scenario where a student's
+        // payment went through but our own verification missed
+        // it, and clicking "Pay" again would otherwise orphan
+        // that successful payment by overwriting the reference
+        // that actually worked.
+
+        if (craftRequest.payment_reference && craftRequest.payment_gateway) {
+
+            try {
+
+                let alreadySucceeded = false;
+                let existingTransactionRef = null;
+
+                if (craftRequest.payment_gateway === "paystack") {
+
+                    const paystackData =
+                        await verifyPaystackTransaction(craftRequest.payment_reference);
+
+                    alreadySucceeded =
+                        paystackData.status === "success" &&
+                        Number(paystackData.amount) >= Math.round(Number(craftRequest.agreed_price) * 100);
+
+                    existingTransactionRef = paystackData.id;
+
+                } else if (craftRequest.payment_gateway === "opay") {
+
+                    const opayData =
+                        await queryOpayPaymentStatus(craftRequest.payment_reference);
+
+                    alreadySucceeded =
+                        opayData.status === "SUCCESS" &&
+                        Number(opayData.amount.total) >= Math.round(Number(craftRequest.agreed_price) * 100);
+
+                    existingTransactionRef = opayData.orderNo;
+
+                }
+
+                if (alreadySucceeded) {
+
+                    const paidResult = await pool.query(
+                        `
+                        UPDATE craft_requests
+                        SET payment_status = 'paid', transaction_reference = $1
+                        WHERE id = $2
+                        RETURNING *
+                        `,
+                        [String(existingTransactionRef), id]
+                    );
+
+                    await createUserNotification(
+                        craftRequest.assigned_provider_id,
+                        "Payment received",
+                        "The student paid for \"" + craftRequest.skill + "\" (" + craftRequest.request_code + ") — you can start whenever ready."
+                    );
+
+                    return res.status(200).json({
+                        success: true,
+                        alreadyPaid: true,
+                        message: "Your earlier payment was found and confirmed — no need to pay again.",
+                        request: paidResult.rows[0]
+                    });
+
+                }
+
+            } catch (checkError) {
+
+                // Couldn't check the old reference (network
+                // blip, gateway hiccup) — fall through to
+                // starting a fresh checkout as before rather
+                // than blocking the student entirely.
+
+                console.error(
+                    "Pre-checkout existing-payment check failed:",
+                    checkError.message
+                );
+
+            }
+
+        }
+
         const freshPaymentReference =
             "kurios_craftreq_" + Date.now() + "_" + crypto.randomInt(100000, 999999);
 
