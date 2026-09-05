@@ -7583,6 +7583,101 @@ async function applySellerPaymentResult(seller, isPaid, isFailed, transactionRef
 }
 
 
+// ========================================
+// SELLER APPLICATION — PAY FROM WALLET
+// ========================================
+
+app.post("/api/sellers/apply/pay-wallet", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const sellerResult = await pool.query(
+            `SELECT * FROM sellers WHERE student_id = $1 ORDER BY created_at DESC LIMIT 1`,
+            [studentId]
+        );
+
+        if (sellerResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "No pending seller application found."
+            });
+
+        }
+
+        const seller =
+            sellerResult.rows[0];
+
+        if (seller.payment_status === "paid") {
+
+            return res.status(200).json({
+                success: true,
+                message: "Payment already confirmed.",
+                seller: seller
+            });
+
+        }
+
+        const studentResult = await pool.query(
+            `SELECT wallet_balance FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        const currentBalance =
+            Number(studentResult.rows[0].wallet_balance || 0);
+
+        if (currentBalance < Number(seller.application_fee)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Your wallet balance isn't enough to cover the application fee."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE students SET wallet_balance = wallet_balance - $1 WHERE id = $2`,
+            [Number(seller.application_fee), studentId]
+        );
+
+        await pool.query(
+            `UPDATE sellers SET payment_gateway = 'wallet' WHERE id = $1`,
+            [seller.id]
+        );
+
+        const result =
+            await applySellerPaymentResult(seller, true, false, "wallet-" + seller.payment_reference, "PAID");
+
+        res.status(200).json(result);
+
+    } catch (error) {
+
+        console.error(
+            "Pay seller application from wallet error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not pay from your wallet."
+        });
+
+    }
+
+});
+
+
 async function verifyAndUpdateSellerPayment(paymentReference) {
 
     const sellerResult = await pool.query(
@@ -9891,6 +9986,117 @@ async function verifyAndUpdateErrandPayment(paymentReference) {
 
 }
 
+
+// ========================================
+// ERRANDS — PAY THE ERRAND FEE FROM WALLET
+// ========================================
+
+app.post("/api/errands/pay/wallet", async (req, res) => {
+
+    try {
+
+        const { paymentReference, studentId } = req.body;
+
+        if (!paymentReference || !studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment reference or studentId."
+            });
+
+        }
+
+        const errandResult = await pool.query(
+            `SELECT * FROM errands WHERE payment_reference = $1 LIMIT 1`,
+            [paymentReference]
+        );
+
+        if (errandResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Errand not found."
+            });
+
+        }
+
+        const errand =
+            errandResult.rows[0];
+
+        if (String(errand.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your errand."
+            });
+
+        }
+
+        if (errand.status !== "pending") {
+
+            return res.status(200).json({
+                success: true,
+                message: "This errand is already paid for.",
+                errand: errand
+            });
+
+        }
+
+        const studentResult = await pool.query(
+            `SELECT wallet_balance FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        const currentBalance =
+            Number(studentResult.rows[0].wallet_balance || 0);
+
+        if (currentBalance < Number(errand.errand_fee)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Your wallet balance isn't enough to cover this errand fee."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE students SET wallet_balance = wallet_balance - $1 WHERE id = $2`,
+            [Number(errand.errand_fee), studentId]
+        );
+
+        const updated = await pool.query(
+            `
+            UPDATE errands
+            SET status = 'available', payment_gateway = 'wallet', transaction_reference = $1
+            WHERE id = $2
+            RETURNING *
+            `,
+            ["wallet-" + errand.payment_reference, errand.id]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Paid from wallet — your errand is now available to agents.",
+            errand: updated.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Pay errand from wallet error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not pay from your wallet."
+        });
+
+    }
+
+});
+
+
 app.post("/api/errands/verify", async (req, res) => {
 
     try {
@@ -10396,6 +10602,111 @@ async function verifyAndUpdateErrandAgentPayment(paymentReference) {
 
 }
 
+
+// ========================================
+// ERRAND AGENT REGISTRATION — PAY FROM WALLET
+// ========================================
+
+app.post("/api/errand-agent/pay-wallet", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const studentResult = await pool.query(
+            `SELECT wallet_balance, is_errand_agent_registered, errand_agent_phone_verified FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        if (studentResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Student not found."
+            });
+
+        }
+
+        const student =
+            studentResult.rows[0];
+
+        if (student.is_errand_agent_registered) {
+
+            return res.status(200).json({
+                success: true,
+                message: "You're already registered as an Errand Agent."
+            });
+
+        }
+
+        if (!student.errand_agent_phone_verified) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please verify your phone number before registering."
+            });
+
+        }
+
+        const currentBalance =
+            Number(student.wallet_balance || 0);
+
+        if (currentBalance < 500) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Your wallet balance isn't enough to cover the ₦500 registration fee."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE students SET wallet_balance = wallet_balance - 500 WHERE id = $1`,
+            [studentId]
+        );
+
+        const updated = await pool.query(
+            `
+            UPDATE students
+            SET is_errand_agent_registered = true, errand_agent_registered_at = CURRENT_TIMESTAMP, errand_agent_payment_gateway = 'wallet'
+            WHERE id = $1
+            RETURNING *
+            `,
+            [studentId]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "You're now a registered Errand Agent.",
+            student: updated.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Pay errand agent registration from wallet error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not pay from your wallet."
+        });
+
+    }
+
+});
+
+
 app.post("/api/errand-agent/verify", async (req, res) => {
 
     try {
@@ -10739,6 +11050,102 @@ async function verifyAndUpdateCraftProviderPayment(paymentReference) {
     };
 
 }
+
+
+// ========================================
+// CRAFT PROVIDER REGISTRATION — PAY FROM WALLET
+// ========================================
+
+app.post("/api/craft-providers/pay-wallet", async (req, res) => {
+
+    try {
+
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const providerResult = await pool.query(
+            `SELECT * FROM craft_providers WHERE student_id = $1 ORDER BY registered_at DESC LIMIT 1`,
+            [studentId]
+        );
+
+        if (providerResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "No pending Craft registration found — please fill in your skills first."
+            });
+
+        }
+
+        const provider =
+            providerResult.rows[0];
+
+        if (provider.status === "active") {
+
+            return res.status(200).json({
+                success: true,
+                message: "You're already registered as a Craft provider."
+            });
+
+        }
+
+        const studentResult = await pool.query(
+            `SELECT wallet_balance FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        const currentBalance =
+            Number(studentResult.rows[0].wallet_balance || 0);
+
+        if (currentBalance < 2000) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Your wallet balance isn't enough to cover the ₦2,000 registration fee."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE students SET wallet_balance = wallet_balance - 2000 WHERE id = $1`,
+            [studentId]
+        );
+
+        const updated = await pool.query(
+            `UPDATE craft_providers SET status = 'active', payment_gateway = 'wallet' WHERE id = $1 RETURNING *`,
+            [provider.id]
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "You're now a registered Craft provider.",
+            provider: updated.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Pay craft provider registration from wallet error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not pay from your wallet."
+        });
+
+    }
+
+});
+
 
 app.post("/api/craft-providers/verify", async (req, res) => {
 
@@ -11773,6 +12180,133 @@ async function verifyAndUpdateCraftRequestPayment(paymentReference) {
     };
 
 }
+
+
+// ========================================
+// CRAFT REQUESTS — PAY FROM WALLET
+// ========================================
+
+app.post("/api/craft-requests/:id/pay-wallet", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const requestResult = await pool.query(
+            `SELECT * FROM craft_requests WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (requestResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Request not found."
+            });
+
+        }
+
+        const craftRequest =
+            requestResult.rows[0];
+
+        if (String(craftRequest.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your request."
+            });
+
+        }
+
+        if (craftRequest.payment_status === "paid") {
+
+            return res.status(200).json({
+                success: true,
+                message: "This request is already paid for.",
+                request: craftRequest
+            });
+
+        }
+
+        if (craftRequest.status !== "assigned") {
+
+            return res.status(400).json({
+                success: false,
+                message: "This request isn't ready for payment yet."
+            });
+
+        }
+
+        const studentResult = await pool.query(
+            `SELECT wallet_balance FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        const currentBalance =
+            Number(studentResult.rows[0].wallet_balance || 0);
+
+        if (currentBalance < Number(craftRequest.agreed_price)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Your wallet balance isn't enough to cover this payment."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE students SET wallet_balance = wallet_balance - $1 WHERE id = $2`,
+            [Number(craftRequest.agreed_price), studentId]
+        );
+
+        const updated = await pool.query(
+            `
+            UPDATE craft_requests
+            SET payment_status = 'paid', payment_gateway = 'wallet', transaction_reference = $1
+            WHERE id = $2
+            RETURNING *
+            `,
+            ["wallet-" + craftRequest.payment_reference, id]
+        );
+
+        await createUserNotification(
+            craftRequest.assigned_provider_id,
+            "Payment received",
+            "The student paid for \"" + craftRequest.skill + "\" (" + craftRequest.request_code + ") from their wallet — you can start whenever ready."
+        );
+
+        res.status(200).json({
+            success: true,
+            message: "Paid from wallet — your provider can now start.",
+            request: updated.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Pay craft request from wallet error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not pay from your wallet."
+        });
+
+    }
+
+});
+
 
 app.post("/api/craft-requests/verify", async (req, res) => {
 
@@ -13312,6 +13846,122 @@ async function verifyAndUpdateErrandItemCostPayment(paymentReference) {
     };
 
 }
+
+
+// ========================================
+// ERRANDS — PAY ITEM COST FROM WALLET
+// ========================================
+
+app.post("/api/errands/:id/pay-item-cost-wallet", async (req, res) => {
+
+    try {
+
+        const { id } = req.params;
+        const { studentId } = req.body;
+
+        if (!studentId) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Missing studentId."
+            });
+
+        }
+
+        const errandResult = await pool.query(
+            `SELECT * FROM errands WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (errandResult.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "Errand not found."
+            });
+
+        }
+
+        const errand =
+            errandResult.rows[0];
+
+        if (String(errand.student_id) !== String(studentId)) {
+
+            return res.status(403).json({
+                success: false,
+                message: "This isn't your errand."
+            });
+
+        }
+
+        if (errand.item_cost_status !== "awaiting_payment") {
+
+            return res.status(400).json({
+                success: false,
+                message: "There's no item cost awaiting payment on this errand."
+            });
+
+        }
+
+        const studentResult = await pool.query(
+            `SELECT wallet_balance FROM students WHERE id = $1 LIMIT 1`,
+            [studentId]
+        );
+
+        const currentBalance =
+            Number(studentResult.rows[0].wallet_balance || 0);
+
+        if (currentBalance < Number(errand.item_cost)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Your wallet balance isn't enough to cover this item cost."
+            });
+
+        }
+
+        await pool.query(
+            `UPDATE students SET wallet_balance = wallet_balance - $1 WHERE id = $2`,
+            [Number(errand.item_cost), studentId]
+        );
+
+        const updated = await pool.query(
+            `UPDATE errands SET item_cost_status = 'paid', item_cost_payment_gateway = 'wallet' WHERE id = $1 RETURNING *`,
+            [id]
+        );
+
+        if (errand.agent_id) {
+
+            await createUserNotification(
+                errand.agent_id,
+                "Item cost paid",
+                "The student paid the ₦" + Number(errand.item_cost).toLocaleString() + " item cost for \"" + errand.title + "\" from their wallet."
+            );
+
+        }
+
+        res.status(200).json({
+            success: true,
+            message: "Item cost paid from wallet.",
+            errand: updated.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Pay item cost from wallet error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not pay from your wallet."
+        });
+
+    }
+
+});
+
 
 app.post("/api/errands/item-cost/verify", async (req, res) => {
 
