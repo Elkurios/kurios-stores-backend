@@ -11973,37 +11973,11 @@ app.post("/api/craft-requests/:id/pay/:gateway", async (req, res) => {
         const amount =
             Number(craftRequest.agreed_price);
 
-        if (!Number.isFinite(amount) || amount <= 0) {
-
-            return res.status(400).json({
-                success: false,
-                message: "This request does not have a valid agreed price."
-            });
-
-        }
-
-        // Older assigned Craft requests may not have a payment reference
-        // because the reference is normally created when the request is
-        // assigned. Create one here as a safe fallback before checkout.
-        let paymentReference = craftRequest.payment_reference;
-
-        if (!paymentReference) {
-
-            paymentReference =
-                "kurios_craftreq_" + Date.now() + "_" + crypto.randomInt(100000, 999999);
-
-            await pool.query(
-                `UPDATE craft_requests SET payment_reference = $1 WHERE id = $2`,
-                [paymentReference, id]
-            );
-
-        }
-
         if (gateway === "monnify") {
 
             return res.status(200).json({
                 success: true,
-                paymentReference: paymentReference,
+                paymentReference: craftRequest.payment_reference,
                 amount: amount,
                 apiKey: MONNIFY_API_KEY,
                 contractCode: MONNIFY_CONTRACT_CODE
@@ -12015,7 +11989,7 @@ app.post("/api/craft-requests/:id/pay/:gateway", async (req, res) => {
 
             const opayData =
                 await createOpayCashierPayment({
-                    reference: paymentReference,
+                    reference: craftRequest.payment_reference,
                     amountNaira: amount,
                     customerName: customerName || "Kurios Student",
                     customerEmail: customerEmail || "",
@@ -12035,7 +12009,7 @@ app.post("/api/craft-requests/:id/pay/:gateway", async (req, res) => {
 
             const paystackData =
                 await initializePaystackTransaction({
-                    reference: paymentReference,
+                    reference: craftRequest.payment_reference,
                     amountNaira: amount,
                     email: customerEmail,
                     callbackUrl: returnUrl
