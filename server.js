@@ -2215,6 +2215,166 @@ async function ensureBlockAndReportTablesExist() {
 
 
 // ========================================
+// COMMISSION SETTINGS
+// (admin-configurable rates by category —
+// nothing about commission is hardcoded
+// once this is in place)
+// ========================================
+
+async function ensureCommissionSettingsExist() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS commission_settings (
+                id SERIAL PRIMARY KEY,
+                key TEXT UNIQUE NOT NULL,
+                label TEXT NOT NULL,
+                rate_percent NUMERIC(5, 2) NOT NULL,
+                min_fee NUMERIC(12, 2) NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        // Seed sensible defaults matching the recommended
+        // model — only inserted once, never overwrites an
+        // admin's later changes.
+
+        const defaults = [
+            ["product_general", "Products (All Categories)", 10, 0],
+            ["craft", "Craft Errands", 11, 0],
+            ["errand", "Errands", 15, 300],
+            ["shop_delivery", "Shop Delivery", 15, 300]
+        ];
+
+        for (const [key, label, rate, minFee] of defaults) {
+
+            await pool.query(
+                `
+                INSERT INTO commission_settings (key, label, rate_percent, min_fee)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (key) DO NOTHING
+                `,
+                [key, label, rate, minFee]
+            );
+
+        }
+
+        // Remove the old category-specific product settings
+        // if an earlier deploy already seeded them — category
+        // differentiation was removed, so these are no longer
+        // read by anything and would just confuse the admin
+        // dashboard if left behind.
+
+        await pool.query(
+            `DELETE FROM commission_settings WHERE key IN ('product_fashion', 'product_electronics', 'product_food')`
+        );
+
+        console.log(
+            "Commission settings are ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not set up commission settings:",
+            error.message
+        );
+
+    }
+
+}
+
+
+async function ensurePlatformRevenueTableExists() {
+
+    try {
+
+        await pool.query(
+            `
+            CREATE TABLE IF NOT EXISTS platform_revenue (
+                id SERIAL PRIMARY KEY,
+                source TEXT NOT NULL,
+                amount NUMERIC(12, 2) NOT NULL,
+                description TEXT,
+                reference_id INTEGER,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            `
+        );
+
+        console.log(
+            "Platform revenue table is ready."
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Could not create platform revenue table:",
+            error.message
+        );
+
+    }
+
+}
+
+
+// ========================================
+// GET A COMMISSION RATE BY KEY
+// (with a safe fallback if the row is
+// somehow missing — never lets a broken
+// lookup mean "free")
+// ========================================
+
+async function getCommissionRate(key) {
+
+    try {
+
+        const result = await pool.query(
+            `SELECT rate_percent, min_fee FROM commission_settings WHERE key = $1 LIMIT 1`,
+            [key]
+        );
+
+        if (result.rows.length === 0) {
+
+            return { ratePercent: 10, minFee: 0 };
+
+        }
+
+        return {
+            ratePercent: Number(result.rows[0].rate_percent),
+            minFee: Number(result.rows[0].min_fee)
+        };
+
+    } catch (error) {
+
+        console.error(
+            "Get commission rate error:",
+            error.message
+        );
+
+        return { ratePercent: 10, minFee: 0 };
+
+    }
+
+}
+
+function commissionKeyForCategory(category) {
+
+    // One flat rate for all products, regardless of
+    // category — kept as a function (rather than inlining
+    // "product_general" everywhere it's called) so a future
+    // change back to category-based rates only needs to
+    // change this one place.
+
+    return "product_general";
+
+}
+
+
+// ========================================
 // ERRANDS
 // ========================================
 
@@ -2579,6 +2739,8 @@ async function runMigrations() {
     await ensureReviewsTableExists();
     await ensureWishlistTableExists();
     await ensureBlockAndReportTablesExist();
+    await ensureCommissionSettingsExist();
+    await ensurePlatformRevenueTableExists();
     await ensureErrandsSchemaExists();
 
 }
@@ -5416,7 +5578,7 @@ async function creditSellersForOrder(order) {
 
     const productsResult = await pool.query(
         `
-        SELECT id, seller_id
+        SELECT id, seller_id, category
         FROM products
         WHERE id = ANY($1::int[])
         AND seller_id IS NOT NULL
@@ -5424,39 +5586,57 @@ async function creditSellersForOrder(order) {
         [productIds]
     );
 
-    const sellerIdByProductId = {};
+    const productById = {};
 
     productsResult.rows.forEach(function (row) {
-        sellerIdByProductId[row.id] = row.seller_id;
+        productById[row.id] = row;
     });
 
 
-    // Group this order's line items by seller.
+    // Group this order's line items by seller, deducting
+    // Kurios' commission per item based on its own category
+    // rate — a Fashion item and an Electronics item in the
+    // same order are charged differently, as intended.
 
-    const subtotalsBySeller = {};
+    const netTotalsBySeller = {};
+    let totalCommission = 0;
 
-    items.forEach(function (item) {
+    for (const item of items) {
 
-        const sellerId =
-            sellerIdByProductId[item.id];
+        const product =
+            productById[item.id];
 
-        if (!sellerId) {
-            return;
+        if (!product) {
+            continue;
         }
 
         const lineTotal =
             Number(item.price) * Number(item.quantity);
 
-        subtotalsBySeller[sellerId] =
-            (subtotalsBySeller[sellerId] || 0) + lineTotal;
+        const commissionKey =
+            commissionKeyForCategory(product.category);
 
-    });
+        const commissionRate =
+            await getCommissionRate(commissionKey);
+
+        const commissionAmount =
+            Math.round(lineTotal * (commissionRate.ratePercent / 100) * 100) / 100;
+
+        const netAmount =
+            lineTotal - commissionAmount;
+
+        netTotalsBySeller[product.seller_id] =
+            (netTotalsBySeller[product.seller_id] || 0) + netAmount;
+
+        totalCommission += commissionAmount;
+
+    }
 
 
-    for (const sellerId of Object.keys(subtotalsBySeller)) {
+    for (const sellerId of Object.keys(netTotalsBySeller)) {
 
         const amount =
-            subtotalsBySeller[sellerId];
+            netTotalsBySeller[sellerId];
 
         await pool.query(
             `
@@ -5477,9 +5657,21 @@ async function creditSellersForOrder(order) {
             [
                 sellerId,
                 amount,
-                "Sale from order #" + order.id,
+                "Sale from order #" + order.id + " (after commission)",
                 order.id
             ]
+        );
+
+    }
+
+    if (totalCommission > 0) {
+
+        await pool.query(
+            `
+            INSERT INTO platform_revenue (source, amount, description, reference_id)
+            VALUES ('product_sale', $1, $2, $3)
+            `,
+            [totalCommission, "Commission from order #" + order.id, order.id]
         );
 
     }
@@ -5538,8 +5730,11 @@ async function createShopDeliveryErrand(order) {
     const errandFee =
         Number(order.delivery_fee || ERRAND_DELIVERY_FLAT_FEE);
 
+    const shopDeliveryRate =
+        await getCommissionRate("shop_delivery");
+
     const commission =
-        Math.round(errandFee * 0.20 * 100) / 100;
+        Math.round(errandFee * (shopDeliveryRate.ratePercent / 100) * 100) / 100;
 
     const agentEarnings =
         errandFee - commission;
@@ -8189,6 +8384,145 @@ app.post(
 // ADMIN — PAYOUT REQUESTS
 // ========================================
 
+// ========================================
+// ADMIN — COMMISSION SETTINGS
+// ========================================
+
+app.get("/api/admin/commission-settings", requireAdminAuth, async (req, res) => {
+
+    try {
+
+        const result = await pool.query(
+            `SELECT * FROM commission_settings ORDER BY key ASC`
+        );
+
+        res.status(200).json({
+            success: true,
+            settings: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch commission settings error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load commission settings."
+        });
+
+    }
+
+});
+
+app.post("/api/admin/commission-settings/:key", requireAdminAuth, async (req, res) => {
+
+    try {
+
+        const { key } = req.params;
+        const { ratePercent, minFee } = req.body;
+
+        if (ratePercent === undefined || isNaN(ratePercent) || Number(ratePercent) < 0 || Number(ratePercent) > 100) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a valid percentage between 0 and 100."
+            });
+
+        }
+
+        const result = await pool.query(
+            `
+            UPDATE commission_settings
+            SET rate_percent = $1, min_fee = $2, updated_at = CURRENT_TIMESTAMP
+            WHERE key = $3
+            RETURNING *
+            `,
+            [Number(ratePercent), Number(minFee) || 0, key]
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(404).json({
+                success: false,
+                message: "That commission setting doesn't exist."
+            });
+
+        }
+
+        res.status(200).json({
+            success: true,
+            setting: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Update commission setting error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not update this commission setting."
+        });
+
+    }
+
+});
+
+
+// ========================================
+// ADMIN — PLATFORM REVENUE OVERVIEW
+// ========================================
+
+app.get("/api/admin/revenue", requireAdminAuth, async (req, res) => {
+
+    try {
+
+        const totalsResult = await pool.query(
+            `
+            SELECT source, SUM(amount) AS total, COUNT(*) AS count
+            FROM platform_revenue
+            GROUP BY source
+            ORDER BY total DESC
+            `
+        );
+
+        const grandTotalResult = await pool.query(
+            `SELECT COALESCE(SUM(amount), 0) AS grand_total FROM platform_revenue`
+        );
+
+        const recentResult = await pool.query(
+            `SELECT * FROM platform_revenue ORDER BY created_at DESC LIMIT 20`
+        );
+
+        res.status(200).json({
+            success: true,
+            bySource: totalsResult.rows,
+            grandTotal: Number(grandTotalResult.rows[0].grand_total),
+            recent: recentResult.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Fetch platform revenue error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not load revenue data."
+        });
+
+    }
+
+});
+
+
 app.get("/api/admin/payouts", requireAdminAuth, async (req, res) => {
 
     try {
@@ -9054,11 +9388,17 @@ app.post("/api/errands/create", async (req, res) => {
 
         }
 
-        if (Number(errandFee) < 100) {
+        const errandRate =
+            await getCommissionRate("errand");
+
+        const minimumErrandFee =
+            Math.max(100, errandRate.minFee);
+
+        if (Number(errandFee) < minimumErrandFee) {
 
             return res.status(400).json({
                 success: false,
-                message: "Errand fee must be at least ₦100."
+                message: "Errand fee must be at least ₦" + minimumErrandFee.toLocaleString() + "."
             });
 
         }
@@ -9069,8 +9409,11 @@ app.post("/api/errands/create", async (req, res) => {
         const errandFeeAmount =
             Number(errandFee);
 
+        const percentCommission =
+            errandFeeAmount * (errandRate.ratePercent / 100);
+
         const commission =
-            Math.round(errandFeeAmount * 0.20 * 100) / 100;
+            Math.round(Math.max(percentCommission, errandRate.minFee) * 100) / 100;
 
         const agentEarnings =
             errandFeeAmount - commission;
@@ -10566,8 +10909,11 @@ app.post("/api/craft-requests/:id/offer", async (req, res) => {
             const deliveryOtp =
                 String(crypto.randomInt(1000, 9999));
 
+            const craftRate =
+                await getCommissionRate("craft");
+
             const commission =
-                Math.round(Number(craftRequest.proposed_price) * 0.20 * 100) / 100;
+                Math.round(Number(craftRequest.proposed_price) * (craftRate.ratePercent / 100) * 100) / 100;
 
             const providerEarnings =
                 Number(craftRequest.proposed_price) - commission;
@@ -10802,8 +11148,11 @@ app.post("/api/craft-requests/:id/offers/:offerId/approve", async (req, res) => 
         const deliveryOtp =
             String(crypto.randomInt(1000, 9999));
 
+        const craftRate =
+            await getCommissionRate("craft");
+
         const commission =
-            Math.round(Number(offer.offered_price) * 0.20 * 100) / 100;
+            Math.round(Number(offer.offered_price) * (craftRate.ratePercent / 100) * 100) / 100;
 
         const providerEarnings =
             Number(offer.offered_price) - commission;
@@ -11458,6 +11807,18 @@ app.post("/api/craft-requests/:id/confirm-completion", async (req, res) => {
             `UPDATE students SET wallet_balance = COALESCE(wallet_balance, 0) + $1 WHERE id = $2`,
             [Number(craftRequest.provider_earnings), craftRequest.assigned_provider_id]
         );
+
+        if (Number(craftRequest.kurios_commission) > 0) {
+
+            await pool.query(
+                `
+                INSERT INTO platform_revenue (source, amount, description, reference_id)
+                VALUES ('craft', $1, $2, $3)
+                `,
+                [Number(craftRequest.kurios_commission), "Commission from craft job " + craftRequest.request_code, craftRequest.id]
+            );
+
+        }
 
         const updated = await pool.query(
             `
@@ -13037,6 +13398,18 @@ app.post("/api/errands/:id/confirm-delivery", async (req, res) => {
             `,
             [errand.agent_id]
         );
+
+        if (Number(errand.kurios_commission) > 0) {
+
+            await pool.query(
+                `
+                INSERT INTO platform_revenue (source, amount, description, reference_id)
+                VALUES ('errand', $1, $2, $3)
+                `,
+                [Number(errand.kurios_commission), "Commission from errand " + errand.errand_code, errand.id]
+            );
+
+        }
 
         const updated = await pool.query(
             `
