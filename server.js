@@ -2245,8 +2245,8 @@ async function ensureCommissionSettingsExist() {
         const defaults = [
             ["product_general", "Products (All Categories)", 10, 0],
             ["craft", "Craft Errands", 11, 0],
-            ["errand", "Errands", 15, 300],
-            ["shop_delivery", "Shop Delivery", 15, 300]
+            ["errand", "Errands", 15, 200],
+            ["shop_delivery", "Shop Delivery", 15, 200]
         ];
 
         for (const [key, label, rate, minFee] of defaults) {
@@ -2270,6 +2270,19 @@ async function ensureCommissionSettingsExist() {
 
         await pool.query(
             `DELETE FROM commission_settings WHERE key IN ('product_fashion', 'product_electronics', 'product_food')`
+        );
+
+        // One-time correction: if this already ran once with
+        // the earlier ₦300 default, bring it to ₦200 now.
+        // Safe to run every startup — once it's actually 200,
+        // this matches and changes nothing.
+
+        await pool.query(
+            `
+            UPDATE commission_settings
+            SET min_fee = 200
+            WHERE key IN ('errand', 'shop_delivery') AND min_fee = 300
+            `
         );
 
         console.log(
@@ -8378,6 +8391,134 @@ app.post(
     requireAdminAuth,
     (req, res) => setStudentSupportStatus(req, res, false)
 );
+
+
+// ========================================
+// ADMIN — DELETE A STUDENT COMPLETELY
+// (irreversible — wrapped in a transaction
+// so it's all-or-nothing, never a partial,
+// half-deleted account)
+// ========================================
+
+app.delete("/api/admin/students/:id", requireAdminAuth, async (req, res) => {
+
+    const { id } = req.params;
+
+    const client = await pool.connect();
+
+    try {
+
+        await client.query("BEGIN");
+
+        const studentCheck = await client.query(
+            `SELECT id FROM students WHERE id = $1 LIMIT 1`,
+            [id]
+        );
+
+        if (studentCheck.rows.length === 0) {
+
+            await client.query("ROLLBACK");
+
+            return res.status(404).json({
+                success: false,
+                message: "Student not found."
+            });
+
+        }
+
+        const sellerResult = await client.query(
+            `SELECT id FROM sellers WHERE student_id = $1`,
+            [id]
+        );
+
+        const sellerIds =
+            sellerResult.rows.map(function (row) { return row.id; });
+
+        if (sellerIds.length > 0) {
+
+            await client.query(
+                `DELETE FROM wallet_transactions WHERE seller_id = ANY($1::int[])`,
+                [sellerIds]
+            );
+
+            await client.query(
+                `DELETE FROM payout_requests WHERE seller_id = ANY($1::int[])`,
+                [sellerIds]
+            );
+
+            await client.query(
+                `DELETE FROM products WHERE seller_id = ANY($1::int[])`,
+                [sellerIds]
+            );
+
+        }
+
+        await client.query(`DELETE FROM sellers WHERE student_id = $1`, [id]);
+        await client.query(`DELETE FROM wishlist_items WHERE student_id = $1`, [id]);
+        await client.query(`DELETE FROM blocked_students WHERE blocker_id = $1 OR blocked_id = $1`, [id]);
+        await client.query(`DELETE FROM reports WHERE reporter_id = $1 OR reported_id = $1`, [id]);
+        await client.query(`DELETE FROM reviews WHERE student_id = $1`, [id]);
+        await client.query(`DELETE FROM user_notifications WHERE student_id = $1`, [id]);
+        await client.query(`DELETE FROM phone_verification_codes WHERE student_id = $1`, [id]);
+        await client.query(`DELETE FROM craft_offers WHERE provider_id = $1`, [id]);
+
+        await client.query(
+            `UPDATE craft_requests SET assigned_provider_id = NULL WHERE assigned_provider_id = $1`,
+            [id]
+        );
+
+        await client.query(`DELETE FROM craft_requests WHERE student_id = $1`, [id]);
+        await client.query(`DELETE FROM craft_providers WHERE student_id = $1`, [id]);
+
+        await client.query(
+            `UPDATE errands SET agent_id = NULL WHERE agent_id = $1`,
+            [id]
+        );
+
+        await client.query(`DELETE FROM errands WHERE student_id = $1`, [id]);
+
+        await client.query(
+            `DELETE FROM conversation_participants WHERE student_id = $1`,
+            [id]
+        );
+
+        await client.query(
+            `DELETE FROM messages WHERE sender_id = $1 OR recipient_id = $1`,
+            [id]
+        );
+
+        await client.query(`DELETE FROM orders WHERE student_id = $1`, [id]);
+
+        await client.query(`DELETE FROM students WHERE id = $1`, [id]);
+
+        await client.query("COMMIT");
+
+        res.status(200).json({
+            success: true,
+            message: "Student and all related data have been permanently deleted."
+        });
+
+    } catch (error) {
+
+        await client.query("ROLLBACK");
+
+        console.error(
+            "Delete student error:",
+            error.message
+        );
+
+        res.status(500).json({
+            success: false,
+            message: "Could not delete this student — nothing was changed. " + error.message
+        });
+
+    } finally {
+
+        client.release();
+
+    }
+
+});
 
 
 // ========================================
