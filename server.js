@@ -11965,10 +11965,24 @@ app.post("/api/craft-requests/:id/pay/:gateway", async (req, res) => {
 
         }
 
-        await pool.query(
-            `UPDATE craft_requests SET payment_gateway = $1 WHERE id = $2`,
-            [gateway, id]
+        // A fresh reference every attempt — if a previous try
+        // actually succeeded on the gateway's side but our own
+        // verification missed it (timing, network blip, etc.),
+        // reusing the same reference would get rejected by the
+        // gateway as a duplicate, permanently stranding the
+        // student. A new reference means every attempt starts
+        // clean.
+
+        const freshPaymentReference =
+            "kurios_craftreq_" + Date.now() + "_" + crypto.randomInt(100000, 999999);
+
+        const refreshedResult = await pool.query(
+            `UPDATE craft_requests SET payment_gateway = $1, payment_reference = $2 WHERE id = $3 RETURNING *`,
+            [gateway, freshPaymentReference, id]
         );
+
+        craftRequest.payment_reference =
+            refreshedResult.rows[0].payment_reference;
 
         const amount =
             Number(craftRequest.agreed_price);
@@ -12000,7 +12014,8 @@ app.post("/api/craft-requests/:id/pay/:gateway", async (req, res) => {
 
             return res.status(200).json({
                 success: true,
-                cashierUrl: opayData.cashierUrl
+                cashierUrl: opayData.cashierUrl,
+                paymentReference: craftRequest.payment_reference
             });
 
         }
@@ -12017,7 +12032,8 @@ app.post("/api/craft-requests/:id/pay/:gateway", async (req, res) => {
 
             return res.status(200).json({
                 success: true,
-                authorizationUrl: paystackData.authorization_url
+                authorizationUrl: paystackData.authorization_url,
+                paymentReference: craftRequest.payment_reference
             });
 
         }
@@ -13671,7 +13687,8 @@ app.post("/api/errands/:id/pay-item-cost/:gateway", async (req, res) => {
 
             return res.status(200).json({
                 success: true,
-                cashierUrl: opayData.cashierUrl
+                cashierUrl: opayData.cashierUrl,
+                paymentReference: paymentReference
             });
 
         }
@@ -13688,7 +13705,8 @@ app.post("/api/errands/:id/pay-item-cost/:gateway", async (req, res) => {
 
             return res.status(200).json({
                 success: true,
-                authorizationUrl: paystackData.authorization_url
+                authorizationUrl: paystackData.authorization_url,
+                paymentReference: paymentReference
             });
 
         }
