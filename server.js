@@ -1394,6 +1394,42 @@ async function ensureProductSellerColumnsExist() {
             "Product seller columns are ready."
         );
 
+        await pool.query(
+            `
+            ALTER TABLE products
+            ADD COLUMN IF NOT EXISTS purchase_count INTEGER DEFAULT 0
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE INDEX IF NOT EXISTS idx_products_category
+            ON products (category)
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE INDEX IF NOT EXISTS idx_products_price
+            ON products (price)
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE INDEX IF NOT EXISTS idx_products_purchase_count
+            ON products (purchase_count DESC)
+            `
+        );
+
+        await pool.query(
+            `
+            CREATE INDEX IF NOT EXISTS idx_products_search
+            ON products
+            USING GIN (to_tsvector('english', coalesce(name, '') || ' ' || coalesce(description, '')))
+            `
+        );
+
     } catch (error) {
 
         console.error(
@@ -2567,6 +2603,51 @@ app.get("/api/products", async (req, res) => {
 
     try {
 
+        const { search, category, minPrice, maxPrice, sort } = req.query;
+
+        const conditions =
+            ["products.is_active = true"];
+
+        const values = [];
+
+        if (search && search.trim()) {
+
+            values.push(search.trim());
+
+            conditions.push(
+                `to_tsvector('english', coalesce(products.name, '') || ' ' || coalesce(products.description, '')) @@ plainto_tsquery('english', $${values.length})`
+            );
+
+        }
+
+        if (category && category.trim()) {
+
+            values.push(category.trim());
+            conditions.push(`products.category = $${values.length}`);
+
+        }
+
+        if (minPrice && !isNaN(minPrice)) {
+
+            values.push(Number(minPrice));
+            conditions.push(`products.price >= $${values.length}`);
+
+        }
+
+        if (maxPrice && !isNaN(maxPrice)) {
+
+            values.push(Number(maxPrice));
+            conditions.push(`products.price <= $${values.length}`);
+
+        }
+
+        const orderClause =
+            sort === "price_asc" ? "ORDER BY products.price ASC" :
+            sort === "price_desc" ? "ORDER BY products.price DESC" :
+            sort === "popular" ? "ORDER BY products.purchase_count DESC NULLS LAST" :
+            sort === "rating" ? "ORDER BY avg_rating DESC NULLS LAST" :
+            "ORDER BY products.id DESC";
+
         const result = await pool.query(
             `
             SELECT
@@ -2584,9 +2665,10 @@ app.get("/api/products", async (req, res) => {
                 FROM reviews
                 GROUP BY product_id
             ) AS review_stats ON review_stats.product_id = products.id
-            WHERE products.is_active = true
-            ORDER BY products.id ASC
-            `
+            WHERE ${conditions.join(" AND ")}
+            ${orderClause}
+            `,
+            values
         );
 
         res.json(
@@ -5398,6 +5480,20 @@ async function creditSellersForOrder(order) {
                 "Sale from order #" + order.id,
                 order.id
             ]
+        );
+
+    }
+
+    // Bump each product's purchase count — used for
+    // "Most Popular" search sorting. Done once here,
+    // per confirmed order, rather than aggregated on
+    // every search request.
+
+    for (const item of items) {
+
+        await pool.query(
+            `UPDATE products SET purchase_count = COALESCE(purchase_count, 0) + $1 WHERE id = $2`,
+            [Number(item.quantity) || 1, item.id]
         );
 
     }
