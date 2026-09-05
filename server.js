@@ -8065,6 +8065,30 @@ async function createUserNotification(studentId, title, message) {
 
     }
 
+    // Also push a real-time signal so the Errands page (and
+    // anywhere else listening) can refresh itself instead of
+    // requiring a manual page reload to see the update.
+
+    try {
+
+        if (typeof io !== "undefined") {
+
+            io.to("student:" + studentId).emit("kurios_update", {
+                title: title,
+                message: message
+            });
+
+        }
+
+    } catch (error) {
+
+        console.error(
+            "Emit real-time update error:",
+            error.message
+        );
+
+    }
+
 }
 
 app.get("/api/notifications/mine", async (req, res) => {
