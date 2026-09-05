@@ -9554,37 +9554,56 @@ async function verifyAndUpdateWalletTopup(paymentReference) {
 
     }
 
-    const updatedTopup = await pool.query(
-        `
-        UPDATE wallet_topups
-        SET status = $1, transaction_reference = $2, updated_at = CURRENT_TIMESTAMP
-        WHERE id = $3
-        RETURNING *
-        `,
-        [isPaid ? "paid" : (isFailed ? "failed" : "pending"), transactionReference, topup.id]
-    );
+    try {
 
-    // Credit the wallet — guarded so this can never
-    // double-credit even if verify gets called twice.
-
-    if (isPaid) {
-
-        await pool.query(
+        const updatedTopup = await pool.query(
             `
-            UPDATE students
-            SET wallet_balance = COALESCE(wallet_balance, 0) + $1
-            WHERE id = $2
+            UPDATE wallet_topups
+            SET status = $1, transaction_reference = $2, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $3
+            RETURNING *
             `,
-            [Number(topup.amount), topup.student_id]
+            [isPaid ? "paid" : (isFailed ? "failed" : "pending"), String(transactionReference || ""), topup.id]
         );
 
-    }
+        // Credit the wallet — guarded so this can never
+        // double-credit even if verify gets called twice.
 
-    return {
-        success: isPaid,
-        message: isPaid ? "Top-up confirmed." : "Payment not yet confirmed.",
-        topup: updatedTopup.rows[0]
-    };
+        if (isPaid) {
+
+            await pool.query(
+                `
+                UPDATE students
+                SET wallet_balance = COALESCE(wallet_balance, 0) + $1
+                WHERE id = $2
+                `,
+                [Number(topup.amount), topup.student_id]
+            );
+
+        }
+
+        return {
+            success: isPaid,
+            message: isPaid ? "Top-up confirmed." : "Payment not yet confirmed.",
+            topup: updatedTopup.rows[0]
+        };
+
+    } catch (error) {
+
+        console.error(
+            "Wallet top-up WAS verified as paid, but recording it failed:",
+            error.message
+        );
+
+        return {
+            success: false,
+            message: isPaid ?
+                "Your payment was confirmed, but we hit an issue saving it. Please contact support — do not pay again." :
+                "Payment not yet confirmed.",
+            topup: topup
+        };
+
+    }
 
 }
 
@@ -9968,21 +9987,40 @@ async function verifyAndUpdateErrandPayment(paymentReference) {
     const newStatus =
         isPaid ? "available" : (isFailed ? "failed" : "pending");
 
-    const updated = await pool.query(
-        `
-        UPDATE errands
-        SET status = $1, transaction_reference = $2
-        WHERE id = $3
-        RETURNING *
-        `,
-        [newStatus, transactionReference, errand.id]
-    );
+    try {
 
-    return {
-        success: isPaid,
-        message: isPaid ? "Payment confirmed — your errand is now available to agents." : "Payment not yet confirmed.",
-        errand: updated.rows[0]
-    };
+        const updated = await pool.query(
+            `
+            UPDATE errands
+            SET status = $1, transaction_reference = $2
+            WHERE id = $3
+            RETURNING *
+            `,
+            [newStatus, String(transactionReference || ""), errand.id]
+        );
+
+        return {
+            success: isPaid,
+            message: isPaid ? "Payment confirmed — your errand is now available to agents." : "Payment not yet confirmed.",
+            errand: updated.rows[0]
+        };
+
+    } catch (error) {
+
+        console.error(
+            "Errand payment WAS verified as paid, but recording it failed:",
+            error.message
+        );
+
+        return {
+            success: false,
+            message: isPaid ?
+                "Your payment was confirmed, but we hit an issue saving it. Please contact support — do not pay again." :
+                "Payment not yet confirmed.",
+            errand: errand
+        };
+
+    }
 
 }
 
@@ -10584,21 +10622,38 @@ async function verifyAndUpdateErrandAgentPayment(paymentReference) {
 
     }
 
-    const updated = await pool.query(
-        `
-        UPDATE students
-        SET is_errand_agent_registered = true, errand_agent_registered_at = CURRENT_TIMESTAMP
-        WHERE id = $1
-        RETURNING *
-        `,
-        [student.id]
-    );
+    try {
 
-    return {
-        success: true,
-        message: "You're now a registered Errand Agent.",
-        student: updated.rows[0]
-    };
+        const updated = await pool.query(
+            `
+            UPDATE students
+            SET is_errand_agent_registered = true, errand_agent_registered_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            RETURNING *
+            `,
+            [student.id]
+        );
+
+        return {
+            success: true,
+            message: "You're now a registered Errand Agent.",
+            student: updated.rows[0]
+        };
+
+    } catch (error) {
+
+        console.error(
+            "Errand agent registration WAS verified as paid, but recording it failed:",
+            error.message
+        );
+
+        return {
+            success: false,
+            message: "Your payment was confirmed, but we hit an issue saving it. Please contact support — do not pay again.",
+            student: student
+        };
+
+    }
 
 }
 
@@ -11038,16 +11093,33 @@ async function verifyAndUpdateCraftProviderPayment(paymentReference) {
 
     }
 
-    const updated = await pool.query(
-        `UPDATE craft_providers SET status = 'active' WHERE id = $1 RETURNING *`,
-        [provider.id]
-    );
+    try {
 
-    return {
-        success: true,
-        message: "You're now a registered Craft provider.",
-        provider: updated.rows[0]
-    };
+        const updated = await pool.query(
+            `UPDATE craft_providers SET status = 'active' WHERE id = $1 RETURNING *`,
+            [provider.id]
+        );
+
+        return {
+            success: true,
+            message: "You're now a registered Craft provider.",
+            provider: updated.rows[0]
+        };
+
+    } catch (error) {
+
+        console.error(
+            "Craft provider registration WAS verified as paid, but recording it failed:",
+            error.message
+        );
+
+        return {
+            success: false,
+            message: "Your payment was confirmed, but we hit an issue saving it. Please contact support — do not pay again.",
+            provider: provider
+        };
+
+    }
 
 }
 
@@ -12173,27 +12245,44 @@ async function verifyAndUpdateCraftRequestPayment(paymentReference) {
 
     }
 
-    const updated = await pool.query(
-        `
-        UPDATE craft_requests
-        SET payment_status = 'paid', transaction_reference = $1
-        WHERE id = $2
-        RETURNING *
-        `,
-        [transactionReference, craftRequest.id]
-    );
+    try {
 
-    await createUserNotification(
-        craftRequest.assigned_provider_id,
-        "Payment received",
-        "The student paid for \"" + craftRequest.skill + "\" (" + craftRequest.request_code + ") — you can start whenever ready."
-    );
+        const updated = await pool.query(
+            `
+            UPDATE craft_requests
+            SET payment_status = 'paid', transaction_reference = $1
+            WHERE id = $2
+            RETURNING *
+            `,
+            [String(transactionReference), craftRequest.id]
+        );
 
-    return {
-        success: true,
-        message: "Payment confirmed.",
-        request: updated.rows[0]
-    };
+        await createUserNotification(
+            craftRequest.assigned_provider_id,
+            "Payment received",
+            "The student paid for \"" + craftRequest.skill + "\" (" + craftRequest.request_code + ") — you can start whenever ready."
+        );
+
+        return {
+            success: true,
+            message: "Payment confirmed.",
+            request: updated.rows[0]
+        };
+
+    } catch (error) {
+
+        console.error(
+            "Craft request payment WAS verified as paid, but recording it failed:",
+            error.message
+        );
+
+        return {
+            success: false,
+            message: "Your payment was confirmed, but we hit an issue saving it. Please contact support — do not pay again.",
+            request: craftRequest
+        };
+
+    }
 
 }
 
@@ -13842,26 +13931,43 @@ async function verifyAndUpdateErrandItemCostPayment(paymentReference) {
 
     }
 
-    const updated = await pool.query(
-        `UPDATE errands SET item_cost_status = 'paid' WHERE id = $1 RETURNING *`,
-        [errand.id]
-    );
+    try {
 
-    if (errand.agent_id) {
-
-        await createUserNotification(
-            errand.agent_id,
-            "Item cost paid",
-            "The student paid the ₦" + Number(errand.item_cost).toLocaleString() + " item cost for \"" + errand.title + "\"."
+        const updated = await pool.query(
+            `UPDATE errands SET item_cost_status = 'paid' WHERE id = $1 RETURNING *`,
+            [errand.id]
         );
 
-    }
+        if (errand.agent_id) {
 
-    return {
-        success: true,
-        message: "Item cost payment confirmed.",
-        errand: updated.rows[0]
-    };
+            await createUserNotification(
+                errand.agent_id,
+                "Item cost paid",
+                "The student paid the ₦" + Number(errand.item_cost).toLocaleString() + " item cost for \"" + errand.title + "\"."
+            );
+
+        }
+
+        return {
+            success: true,
+            message: "Item cost payment confirmed.",
+            errand: updated.rows[0]
+        };
+
+    } catch (error) {
+
+        console.error(
+            "Item cost payment WAS verified as paid, but recording it failed:",
+            error.message
+        );
+
+        return {
+            success: false,
+            message: "Your payment was confirmed, but we hit an issue saving it. Please contact support — do not pay again.",
+            errand: errand
+        };
+
+    }
 
 }
 
